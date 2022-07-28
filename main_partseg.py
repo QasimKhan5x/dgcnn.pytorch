@@ -23,6 +23,8 @@ from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
 from plyfile import PlyData, PlyElement
+from tqdm import trange
+# from tqdm.notebook import trange
 
 global class_cnts
 class_indexs = np.zeros((16,), dtype=int)
@@ -175,7 +177,7 @@ def train(args, io):
     criterion = cal_loss
 
     best_test_iou = 0
-    for epoch in range(args.epochs):
+    for epoch in trange(args.epochs):
         ####################
         # Train
         ####################
