@@ -143,9 +143,9 @@ def train(args, io):
         drop_last = False
     else:
         drop_last = True
-    train_loader = DataLoader(train_dataset, num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=drop_last)
+    train_loader = DataLoader(train_dataset, num_workers=args., batch_size=args.batch_size, shuffle=True, drop_last=drop_last)
     test_loader = DataLoader(ShapeNetPart(partition='test', num_points=args.num_points, class_choice=args.class_choice), 
-                            num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+                            num_workers=num_workers, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
     
     device = torch.device("cuda" if args.cuda else "cpu")
 
@@ -387,6 +387,8 @@ if __name__ == "__main__":
                         help='evaluate the model')
     parser.add_argument('--num_points', type=int, default=2048,
                         help='num of points to use')
+    parser.add_argument('--num_workers', type=int, default=2,
+                        help='num of worker processes to use')
     parser.add_argument('--dropout', type=float, default=0.5,
                         help='dropout rate')
     parser.add_argument('--emb_dims', type=int, default=1024, metavar='N',
