@@ -156,7 +156,6 @@ def train(args, io):
         model = DGCNN_partseg(args, seg_num_all).to(device)
     else:
         raise Exception("Not implemented")
-    print(str(model))
 
     model = nn.DataParallel(model)
     print("Let's use", torch.cuda.device_count(), "GPUs!")
@@ -235,7 +234,7 @@ def train(args, io):
                                                                                                   avg_per_class_acc,
                                                                                                   np.mean(train_ious))
         io.cprint(outstr)
-
+        torch.cuda.empty_cache()
         ####################
         # Test
         ####################
@@ -286,7 +285,7 @@ def train(args, io):
         if np.mean(test_ious) >= best_test_iou:
             best_test_iou = np.mean(test_ious)
             torch.save(model.state_dict(), 'outputs/%s/models/model.t7' % args.exp_name)
-
+        torch.cuda.empty_cache()
 
 def test(args, io):
     test_loader = DataLoader(ShapeNetPart(partition='test', num_points=args.num_points, class_choice=args.class_choice),
@@ -321,7 +320,8 @@ def test(args, io):
         data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
         data = data.permute(0, 2, 1)
         batch_size = data.size()[0]
-        seg_pred = model(data, label_one_hot)
+        with torch.no_grad():
+            seg_pred = model(data, label_one_hot)
         seg_pred = seg_pred.permute(0, 2, 1).contiguous()
         pred = seg_pred.max(dim=2)[1]
         seg_np = seg.cpu().numpy()
