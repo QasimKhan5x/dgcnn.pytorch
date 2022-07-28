@@ -255,7 +255,8 @@ def train(args, io):
             data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
-            seg_pred = model(data, label_one_hot)
+            with torch.no_grad():
+                seg_pred = model(data, label_one_hot)
             seg_pred = seg_pred.permute(0, 2, 1).contiguous()
             loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
             pred = seg_pred.max(dim=2)[1]
