@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 # Part of the code is referred from: http://nlp.seas.harvard.edu/annotated-transformer/
 
+
 def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
@@ -50,7 +51,7 @@ def get_graph_feature(x, k=20, knn_only=False, disp_only=False):
         return feature
     elif disp_only:
         return (feature - x).permute(0, 3, 1, 2)
-    
+
     feature = torch.cat((feature, x), dim=3).permute(0, 3, 1, 2)
 
     return feature
@@ -247,7 +248,7 @@ class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super(PositionwiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(d_model, d_ff)
-        self.norm =  nn.BatchNorm1d(d_ff)
+        self.norm = nn.BatchNorm1d(d_ff)
         self.w_2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(p=dropout)
 
@@ -400,7 +401,7 @@ class MLPHead(nn.Module):
                                 nn.BatchNorm1d(emb_dims // 8),
                                 nn.ReLU(),
                                 nn.Conv1d(emb_dims // 8, args.nclasses, 1)
-                              )
+                                )
 
     def forward(self, x):
         x = x.transpose(2, 1).contiguous()
@@ -420,7 +421,7 @@ class Transformer(nn.Module):
         ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
         self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),
                                     Decoder(DecoderLayer(self.emb_dims, c(attn), c(attn),
-                                    c(ff), self.dropout), self.N),
+                                                         c(ff), self.dropout), self.N),
                                     nn.Sequential(),
                                     nn.Sequential(),
                                     nn.Sequential())
@@ -429,7 +430,7 @@ class Transformer(nn.Module):
         # (batch_size, emb_dims, num_points)
         src = input[0]
         # (batch_size, emb_dims, num_points)
-        tgt = input[1]  
+        tgt = input[1]
         # (batch_size, emb_dims, num_points)
         src = src.transpose(2, 1).contiguous()
         # (batch_size, emb_dims, num_points)
@@ -458,7 +459,7 @@ class Net(nn.Module):
         # (batch_size, emb_dims, num_points)
         src_embedding = self.emb_nn(self.tnet(src))
         # (batch_size, 3, num_points)
-        tgt = get_gradients(src, k=self.k).transpose(1,2).contiguous()
+        tgt = get_gradients(src, k=self.k).transpose(1, 2).contiguous()
         # (batch_size, emb_dims, num_points)
         tgt_embedding = self.emb_nn(tgt)
         # (batch_size, emb_dims, num_points)

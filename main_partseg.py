@@ -14,7 +14,6 @@ import argparse
 import gc
 import os
 
-from  import isfile
 from plyfile import PlyData, PlyElement
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -31,8 +30,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, StepLR
 from torch.utils.data import DataLoader
 
 from data import ShapeNetPart
-from dcp_model import Net
-from model import DGCNN_partseg
+from model_dcp import Net
 from util import IOStream, cal_loss
 
 global class_cnts
@@ -180,9 +178,7 @@ def train(args, io):
     # Try to load models
     seg_num_all = train_loader.dataset.seg_num_all
     seg_start_index = train_loader.dataset.seg_start_index
-    if args.model == 'dgcnn':
-        model = DGCNN_partseg(args, seg_num_all).to(device)
-    elif args.model == 'transformer':
+    if args.model == 'transformer':
         model = Net(args).to(device)
     else:
         raise Exception("Not implemented")
