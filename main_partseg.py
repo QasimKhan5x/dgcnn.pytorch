@@ -14,9 +14,10 @@ import argparse
 import gc
 import os
 
+from  import isfile
 from plyfile import PlyData, PlyElement
-from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
 
@@ -186,35 +187,40 @@ def train(args, io):
     else:
         raise Exception("Not implemented")
 
-
-    # Convert BatchNorm to SyncBatchNorm.
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    # model = nn.DataParallel(model)
-    
-    # wrap the model with DDP
-    # device_ids tell DDP where is your model
-    # output_device tells DDP where to output, in our case, it is rank
-    # find_unused_parameters=True instructs DDP to find unused output of the forward() function of any module in the model
-    model = DDP(model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                find_unused_parameters=True)
-    print("Let's use", torch.cuda.device_count(), "GPUs!")
-
-    if args.use_sgd:
-        print("Use SGD")
-        opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
+    if os.path.isfile(f'outputs/{args.exp_name}/ckpt.checkpoint'):
+        model, opt, scheduler = load_checkpoint(
+            path=f'outputs/{args.exp_name}/ckpt.checkpoint',
+            args=args,
+            train_dl_size=len(train_loader))
     else:
-        print("Use AdamW")
-        opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        # Convert BatchNorm to SyncBatchNorm.
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    if args.scheduler == 'cos':
-        scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
-    elif args.scheduler == 'step':
-        scheduler = StepLR(opt, step_size=20, gamma=0.5)
-    else:
-        scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
+        # model = nn.DataParallel(model)
+        
+        # wrap the model with DDP
+        # device_ids tell DDP where is your model
+        # output_device tells DDP where to output, in our case, it is rank
+        # find_unused_parameters=True instructs DDP to find unused output of the forward() function of any module in the model
+        model = DDP(model,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=True)
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+
+        if args.use_sgd:
+            print("Use SGD")
+            opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
+        else:
+            print("Use AdamW")
+            opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+        if args.scheduler == 'cos':
+            scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
+        elif args.scheduler == 'step':
+            scheduler = StepLR(opt, step_size=20, gamma=0.5)
+        else:
+            scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
 
     criterion = cal_loss
 
@@ -334,9 +340,37 @@ def train(args, io):
         io.cprint(outstr)
         if np.mean(test_ious) >= best_test_iou:
             best_test_iou = np.mean(test_ious)
-            torch.save(model.state_dict(), 'outputs/%s/models/transformer.pt' % args.exp_name)
+            torch.save(model.module.state_dict(),
+                       'outputs/%s/models/transformer.pt' % args.exp_name)
+        save_checkpoint(epoch, model, opt, scheduler, train_loss, args.exp_name)
         gc.collect()
         torch.cuda.empty_cache()
+
+def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name):
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.module.state_dict(),
+        'optimizer_state_dict': opt.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': loss,
+    }, f'outputs/{exp_name}/ckpt.checkpoint')
+
+
+def load_checkpoint(path, args, train_dl_size):
+    checkpoint = torch.load(path)
+    model = Net(args)
+    opt = optim.SGD(model.parameters(), lr=args.lr*100,
+                    momentum=args.momentum, weight_decay=1e-4)
+    scheduler = OneCycleLR(opt, max_lr=args.lr*100,
+                           epochs=200, steps_per_epoch=train_dl_size)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    opt.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = DDP(model, device_ids=[int(os.environ["LOCAL_RANK"])],
+                find_unused_parameters=True)
+    return model, opt, scheduler
+
 
 
 def test(args, io):
