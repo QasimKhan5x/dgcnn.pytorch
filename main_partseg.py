@@ -15,8 +15,8 @@ import gc
 import os
 
 from plyfile import PlyData, PlyElement
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
 
@@ -25,7 +25,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim. import CosineAnnealingLR, OneCycleLR, StepLR
+from sklearn import metrics
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, StepLR
 from torch.utils.data import DataLoader
 
 from data import ShapeNetPart
@@ -165,13 +166,15 @@ def train(args, io):
     else:
         drop_last = True
 
-    train_loader = DataLoader(train_dataset, num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=drop_last)
-    # train_loader = prepare_dl(train_dataset, drop_last=drop_last, shuffle=True, batch_size=args.batch_size, num_workers=0)
-    test_loader = DataLoader(test_dataset, num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
-    # test_loader = prepare_dl(test_dataset, drop_last=False, shuffle=False,
-    #                          batch_size=args.test_batch_size, num_workers=0)
+    # train_loader = DataLoader(train_dataset, num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=drop_last)
+    # test_loader = DataLoader(test_dataset, num_workers=8,
+    #                          batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    train_loader = prepare_dl(train_dataset, drop_last=drop_last, shuffle=True, batch_size=args.batch_size)
+    test_loader = prepare_dl(test_dataset, drop_last=False, shuffle=False,
+                             batch_size=args.test_batch_size)
     
-    device = torch.device("cuda" if args.cuda else "cpu")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(local_rank)
 
     # Try to load models
     seg_num_all = train_loader.dataset.seg_num_all
@@ -185,19 +188,18 @@ def train(args, io):
 
 
     # Convert BatchNorm to SyncBatchNorm.
-    # model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    model = nn.DataParallel(model)
-    # local_rank = int(os.environ["LOCAL_RANK"])
-    # model = model.to(local_rank)
+    # model = nn.DataParallel(model)
+    
     # wrap the model with DDP
     # device_ids tell DDP where is your model
     # output_device tells DDP where to output, in our case, it is rank
     # find_unused_parameters=True instructs DDP to find unused output of the forward() function of any module in the model
-    # model = DDP(model,
-    #             device_ids=[local_rank],
-    #             output_device=local_rank,
-    #             find_unused_parameters=True)
+    model = DDP(model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True)
     print("Let's use", torch.cuda.device_count(), "GPUs!")
 
     if args.use_sgd:
@@ -233,7 +235,6 @@ def train(args, io):
         train_pred_seg = []
         train_label_seg = []
         for data, label, seg in train_loader:
-            
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
             for idx in range(label.shape[0]):
@@ -298,7 +299,6 @@ def train(args, io):
         test_pred_seg = []
         test_label_seg = []
         for data, label, seg in test_loader:
-            
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
             for idx in range(label.shape[0]):
@@ -372,7 +372,8 @@ def test(args, io):
         data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
         data = data.permute(0, 2, 1)
         batch_size = data.size()[0]
-        seg_pred = model(data, label_one_hot)
+        with torch.no_grad():
+            seg_pred = model(data, label_one_hot)
         seg_pred = seg_pred.permute(0, 2, 1).contiguous()
         pred = seg_pred.max(dim=2)[1]
         seg_np = seg.cpu().numpy()
@@ -415,15 +416,15 @@ def main(args):
         io.cprint('Using CPU')
 
     # setup the process group
-    # os.environ['MASTER_ADDR'] = 'localhost'
-    # os.environ['MASTER_PORT'] = '12355'
-    # dist.init_process_group('nccl', init_method='env://')
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group('nccl', init_method='env://')
 
     if not args.eval:
         train(args, io)
     else:
         test(args, io)
-    # dist.destroy_process_group()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -447,7 +447,9 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.k = args.k
         self.tnet = Transform_Net(args)
+        self.tnet.load_state_dict(torch.load('ckpts/tnet.pt'))
         self.emb_nn = DGCNN(args)
+        self.emb_nn.load_state_dict(torch.load('ckpts/dgcnn.pt'))
         self.transformer = Transformer(args)
         self.head = MLPHead(args)
 
