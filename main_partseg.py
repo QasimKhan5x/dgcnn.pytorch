@@ -9,20 +9,29 @@
 
 
 from __future__ import print_function
-import os
+
 import argparse
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
-from data import ShapeNetPart
-from model import DGCNN_partseg
-import numpy as np
-from torch.utils.data import DataLoader
-from util import cal_loss, IOStream
-import sklearn.metrics as metrics
+import gc
+import os
+
 from plyfile import PlyData, PlyElement
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim. import CosineAnnealingLR, OneCycleLR, StepLR
+from torch.utils.data import DataLoader
+
+from data import ShapeNetPart
+from dcp_model import Net
+from model import DGCNN_partseg
+from util import IOStream, cal_loss
 
 global class_cnts
 class_indexs = np.zeros((16,), dtype=int)
@@ -137,41 +146,73 @@ def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, cla
             class_indexs[int(label[i])] = class_indexs[int(label[i])] + 1
 
 
+def prepare_dl(dataset, drop_last, shuffle, batch_size, pin_memory=False, num_workers=0):
+    '''split the dataloader to each process in the process group'''
+    sampler = DistributedSampler(dataset, num_replicas=int(os.environ['WORLD_SIZE']),
+                                 rank=int(os.environ['RANK']), shuffle=shuffle, drop_last=drop_last)
+    dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=pin_memory,
+                            num_workers=num_workers, drop_last=drop_last, shuffle=shuffle,
+                            sampler=sampler)
+    return dataloader
+
+
 def train(args, io):
     train_dataset = ShapeNetPart(partition='trainval', num_points=args.num_points, class_choice=args.class_choice)
-    if (len(train_dataset) < 100):
+    test_dataset = ShapeNetPart(
+        partition='test', num_points=args.num_points, class_choice=args.class_choice)
+    if len(train_dataset) < 100:
         drop_last = False
     else:
         drop_last = True
+
     train_loader = DataLoader(train_dataset, num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=drop_last)
-    test_loader = DataLoader(ShapeNetPart(partition='test', num_points=args.num_points, class_choice=args.class_choice), 
-                            num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    # train_loader = prepare_dl(train_dataset, drop_last=drop_last, shuffle=True, batch_size=args.batch_size, num_workers=0)
+    test_loader = DataLoader(test_dataset, num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    # test_loader = prepare_dl(test_dataset, drop_last=False, shuffle=False,
+    #                          batch_size=args.test_batch_size, num_workers=0)
     
     device = torch.device("cuda" if args.cuda else "cpu")
 
-    #Try to load models
+    # Try to load models
     seg_num_all = train_loader.dataset.seg_num_all
     seg_start_index = train_loader.dataset.seg_start_index
     if args.model == 'dgcnn':
         model = DGCNN_partseg(args, seg_num_all).to(device)
+    elif args.model == 'transformer':
+        model = Net(args).to(device)
     else:
         raise Exception("Not implemented")
-    print(str(model))
+
+
+    # Convert BatchNorm to SyncBatchNorm.
+    # model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     model = nn.DataParallel(model)
+    # local_rank = int(os.environ["LOCAL_RANK"])
+    # model = model.to(local_rank)
+    # wrap the model with DDP
+    # device_ids tell DDP where is your model
+    # output_device tells DDP where to output, in our case, it is rank
+    # find_unused_parameters=True instructs DDP to find unused output of the forward() function of any module in the model
+    # model = DDP(model,
+    #             device_ids=[local_rank],
+    #             output_device=local_rank,
+    #             find_unused_parameters=True)
     print("Let's use", torch.cuda.device_count(), "GPUs!")
 
     if args.use_sgd:
         print("Use SGD")
         opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
     else:
-        print("Use Adam")
-        opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        print("Use AdamW")
+        opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     if args.scheduler == 'cos':
         scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
     elif args.scheduler == 'step':
         scheduler = StepLR(opt, step_size=20, gamma=0.5)
+    else:
+        scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
 
     criterion = cal_loss
 
@@ -182,6 +223,9 @@ def train(args, io):
         ####################
         train_loss = 0.0
         count = 0.0
+        # if we are using DistributedSampler, we have to tell it which epoch this is
+        train_loader.sampler.set_epoch(epoch)
+        test_loader.sampler.set_epoch(epoch)
         model.train()
         train_true_cls = []
         train_pred_cls = []
@@ -189,20 +233,26 @@ def train(args, io):
         train_pred_seg = []
         train_label_seg = []
         for data, label, seg in train_loader:
+            
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
             for idx in range(label.shape[0]):
                 label_one_hot[idx, label[idx]] = 1
             label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
-            data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
+            data, label_one_hot, seg = \
+                data.to(device, non_blocking=True), \
+                label_one_hot.to(device, non_blocking=True), \
+                seg.to(device, non_blocking=True)
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()
-            seg_pred = model(data, label_one_hot)
+            seg_pred = model(data)
             seg_pred = seg_pred.permute(0, 2, 1).contiguous()
             loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
             loss.backward()
             opt.step()
+            if args.scheduler == 'cycle':
+                scheduler.step()
             pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
             count += batch_size
             train_loss += loss.item() * batch_size
@@ -235,11 +285,11 @@ def train(args, io):
                                                                                                   avg_per_class_acc,
                                                                                                   np.mean(train_ious))
         io.cprint(outstr)
-
+        gc.collect()
+        torch.cuda.empty_cache()
         ####################
         # Test
         ####################
-        test_loss = 0.0
         count = 0.0
         model.eval()
         test_true_cls = []
@@ -248,6 +298,7 @@ def train(args, io):
         test_pred_seg = []
         test_label_seg = []
         for data, label, seg in test_loader:
+            
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
             for idx in range(label.shape[0]):
@@ -256,12 +307,11 @@ def train(args, io):
             data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
-            seg_pred = model(data, label_one_hot)
+            with torch.no_grad():
+                seg_pred = model(data)
             seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-            loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
             pred = seg_pred.max(dim=2)[1]
             count += batch_size
-            test_loss += loss.item() * batch_size
             seg_np = seg.cpu().numpy()
             pred_np = pred.detach().cpu().numpy()
             test_true_cls.append(seg_np.reshape(-1))
@@ -277,15 +327,16 @@ def train(args, io):
         test_pred_seg = np.concatenate(test_pred_seg, axis=0)
         test_label_seg = np.concatenate(test_label_seg)
         test_ious = calculate_shape_IoU(test_pred_seg, test_true_seg, test_label_seg, args.class_choice)
-        outstr = 'Test %d, loss: %.6f, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
-                                                                                              test_loss*1.0/count,
-                                                                                              test_acc,
-                                                                                              avg_per_class_acc,
-                                                                                              np.mean(test_ious))
+        outstr = 'Test %d, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
+                                                                                  test_acc,
+                                                                                  avg_per_class_acc,
+                                                                                  np.mean(test_ious))
         io.cprint(outstr)
         if np.mean(test_ious) >= best_test_iou:
             best_test_iou = np.mean(test_ious)
-            torch.save(model.state_dict(), 'outputs/%s/models/model.t7' % args.exp_name)
+            torch.save(model.state_dict(), 'outputs/%s/models/transformer.pt' % args.exp_name)
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def test(args, io):
@@ -348,20 +399,48 @@ def test(args, io):
                                                                              np.mean(test_ious))
     io.cprint(outstr)
 
+def main(args):
+    io = IOStream('outputs/' + args.exp_name + '/run.log')
+    io.cprint(str(args))
+
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)  # before your code runs
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        io.cprint(
+            'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
+        torch.cuda.manual_seed(args.seed)
+    else:
+        io.cprint('Using CPU')
+
+    # setup the process group
+    # os.environ['MASTER_ADDR'] = 'localhost'
+    # os.environ['MASTER_PORT'] = '12355'
+    # dist.init_process_group('nccl', init_method='env://')
+
+    if not args.eval:
+        train(args, io)
+    else:
+        test(args, io)
+    # dist.destroy_process_group()
+
 
 if __name__ == "__main__":
+
     # Training settings
-    parser = argparse.ArgumentParser(description='Point Cloud Part Segmentation')
+    parser = argparse.ArgumentParser(
+        description='Point Cloud Part Segmentation')
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
-    parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
-                        choices=['dgcnn'],
+    parser.add_argument('--model', type=str, default='transformer', metavar='N',
+                        choices=['dgcnn', 'transformer'],
                         help='Model to use, [dgcnn]')
     parser.add_argument('--dataset', type=str, default='shapenetpart', metavar='N',
                         choices=['shapenetpart'])
     parser.add_argument('--class_choice', type=str, default=None, metavar='N',
                         choices=['airplane', 'bag', 'cap', 'car', 'chair',
-                                 'earphone', 'guitar', 'knife', 'lamp', 'laptop', 
+                                 'earphone', 'guitar', 'knife', 'lamp', 'laptop',
                                  'motor', 'mug', 'pistol', 'rocket', 'skateboard', 'table'])
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
                         help='Size of batch)')
@@ -375,19 +454,27 @@ if __name__ == "__main__":
                         help='learning rate (default: 0.001, 0.1 if using sgd)')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
-    parser.add_argument('--scheduler', type=str, default='cos', metavar='N',
+    parser.add_argument('--scheduler', type=str, default='cycle', metavar='N',
                         choices=['cos', 'step'],
                         help='Scheduler to use, [cos, step]')
     parser.add_argument('--no_cuda', type=bool, default=False,
                         help='enables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
+    parser.add_argument('--ff_dims', type=int, default=256,
+                        help='dimension of feed forward network inside transformer')
+    parser.add_argument('--n_heads', type=int, default=4,
+                        help='number of attention heads')
+    parser.add_argument('--n_blocks', type=int, default=4,
+                        help='number of layers of encoder/decoder')
     parser.add_argument('--eval', type=bool,  default=False,
                         help='evaluate the model')
     parser.add_argument('--num_points', type=int, default=2048,
                         help='num of points to use')
+    parser.add_argument('--nclasses', type=int, default=50,
+                        help='number of classes to predict')
     parser.add_argument('--dropout', type=float, default=0.5,
-                        help='dropout rate')
+                        help='dropout rate'),
     parser.add_argument('--emb_dims', type=int, default=1024, metavar='N',
                         help='Dimension of embeddings')
     parser.add_argument('--k', type=int, default=40, metavar='N',
@@ -398,23 +485,10 @@ if __name__ == "__main__":
                         help='visualize the model')
     parser.add_argument('--visu_format', type=str, default='ply',
                         help='file format of visualization')
+    parser.add_argument('-nr', '--nr', default=0, type=int,
+                        help='ranking within the nodes')
     args = parser.parse_args()
-
+    
     _init_()
 
-    io = IOStream('outputs/' + args.exp_name + '/run.log')
-    io.cprint(str(args))
-
-    args.cuda = not args.no_cuda and torch.cuda.is_available()
-    torch.manual_seed(args.seed)
-    if args.cuda:
-        io.cprint(
-            'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
-        torch.cuda.manual_seed(args.seed)
-    else:
-        io.cprint('Using CPU')
-
-    if not args.eval:
-        train(args, io)
-    else:
-        test(args, io)
+    main(args)

@@ -355,12 +355,13 @@ class S3DIS(Dataset):
 
 
 if __name__ == '__main__':
-    train = ModelNet40(1024)
-    test = ModelNet40(1024, 'test')
-    data, label = train[0]
-    print(data.shape)
-    print(label.shape)
+    # train = ModelNet40(1024)
+    # test = ModelNet40(1024, 'test')
+    # data, label = train[0]
+    # print(data.shape)
+    # print(label.shape)
 
+    download_shapenetpart()
     trainval = ShapeNetPart(2048, 'trainval')
     test = ShapeNetPart(2048, 'test')
     data, label, seg = trainval[0]
@@ -368,8 +369,8 @@ if __name__ == '__main__':
     print(label.shape)
     print(seg.shape)
 
-    train = S3DIS(4096)
-    test = S3DIS(4096, 'test')
-    data, seg = train[0]
-    print(data.shape)
-    print(seg.shape)
+    # train = S3DIS(4096)
+    # test = S3DIS(4096, 'test')
+    # data, seg = train[0]
+    # print(data.shape)
+    # print(seg.shape)
