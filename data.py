@@ -12,15 +12,19 @@ Modified by
 @Time: 2021/7/20 7:49 PM
 """
 
-
-import os
-import sys
 import glob
+import json
+import math
+import os
+import random
+import sys
+
+random.seed(42)
+
+import cv2
 import h5py
 import numpy as np
 import torch
-import json
-import cv2
 from torch.utils.data import Dataset
 
 
@@ -252,23 +256,23 @@ def load_color_semseg():
     
 
 def translate_pointcloud(pointcloud):
-    xyz1 = np.random.uniform(low=2./3., high=3./2., size=[3])
-    xyz2 = np.random.uniform(low=-0.2, high=0.2, size=[3])
-       
-    translated_pointcloud = np.add(np.multiply(pointcloud, xyz1), xyz2).astype('float32')
+    xyz1 = torch.distributions.uniform.Uniform(2/3, 3/2).sample([3])
+    xyz2 = torch.distributions.uniform.Uniform(-0.2, 0.2).sample([3])       
+    translated_pointcloud = torch.add(torch.multiply(pointcloud, xyz1), xyz2)
     return translated_pointcloud
 
 
 def jitter_pointcloud(pointcloud, sigma=0.01, clip=0.02):
     N, C = pointcloud.shape
-    pointcloud += np.clip(sigma * np.random.randn(N, C), -1*clip, clip)
+    pointcloud += torch.clamp(sigma * torch.randn(N, C), -1 * clip, clip)
     return pointcloud
 
 
 def rotate_pointcloud(pointcloud):
-    theta = np.pi*2 * np.random.uniform()
-    rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]])
-    pointcloud[:,[0,2]] = pointcloud[:,[0,2]].dot(rotation_matrix) # random rotation (x,z)
+    theta = math.pi * 2 * torch.randn(size=(1,))
+    rotation_matrix = torch.tensor(
+        [[torch.cos(theta), -torch.sin(theta)], [torch.sin(theta), torch.cos(theta)]])
+    pointcloud[:, [0, 2]] = torch.matmul(pointcloud[:, [0, 2]], rotation_matrix)  # random rotation (x,z)
     return pointcloud
 
 
@@ -332,6 +336,34 @@ class ShapeNetPart(Dataset):
         return self.data.shape[0]
 
 
+class ShapeNetPart_Augmented(Dataset):
+    def __init__(self, partition) -> None:
+        super(Dataset).__init__()
+
+        assert partition in ("train", "trainval", "test")
+        if partition == "trainval":
+            partition = "train"
+
+        self.partition = partition
+        self.data = torch.load(f"data/shapenetpart_{partition}_dataset.pt")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        pointcloud, label, seg = self.data[index]
+        if self.partition == "train":
+            functions = [translate_pointcloud,
+                         jitter_pointcloud, 
+                         rotate_pointcloud]
+            random.shuffle(functions)
+            choices = torch.randint(low=0, high=2, size=(3,))
+            for func, choice in zip(functions, choices):
+                if choice.item():
+                    pointcloud = func(pointcloud)
+        return pointcloud, label, seg
+        
+
 class S3DIS(Dataset):
     def __init__(self, num_points=4096, partition='train', test_area='1'):
         self.data, self.seg = load_data_semseg(partition, test_area)
@@ -355,19 +387,32 @@ class S3DIS(Dataset):
 
 
 if __name__ == '__main__':
+    print("hello world")
     # train = ModelNet40(1024)
     # test = ModelNet40(1024, 'test')
     # data, label = train[0]
     # print(data.shape)
     # print(label.shape)
 
-    download_shapenetpart()
-    trainval = ShapeNetPart(2048, 'trainval')
-    test = ShapeNetPart(2048, 'test')
-    data, label, seg = trainval[0]
-    print(data.shape)
-    print(label.shape)
-    print(seg.shape)
+    # download_shapenetpart()
+    # data, label, seg = load_data_partseg('trainval')
+    # train_ds = torch.utils.data.TensorDataset(torch.from_numpy(data),
+    #                                           torch.from_numpy(label),
+    #                                           torch.from_numpy(seg))
+
+    # data, label, seg = load_data_partseg('test')
+    # test_ds = torch.utils.data.TensorDataset(torch.from_numpy(data),
+    #                                         torch.from_numpy(label),
+    #                                         torch.from_numpy(seg))
+    # torch.save(train_ds, "train_dataset.pt")
+    # torch.save(test_ds, "test_dataset.pt")
+
+    # print(len(trainval))
+
+    # data, label, seg = trainval[0]
+    # print(data.shape)
+    # print(label.shape)
+    # print(seg.shape)
 
     # train = S3DIS(4096)
     # test = S3DIS(4096, 'test')

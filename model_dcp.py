@@ -3,7 +3,9 @@
 
 import copy
 import math
+import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,11 +52,142 @@ def get_graph_feature(x, k=20, knn_only=False, disp_only=False):
     if knn_only:
         return feature
     elif disp_only:
-        return (feature - x).permute(0, 3, 1, 2)
+        return (feature - x).permute(0, 3, 1, 2).contiguous()
 
-    feature = torch.cat((feature, x), dim=3).permute(0, 3, 1, 2)
+    feature = torch.cat((feature, x), dim=3).permute(0, 3, 1, 2).contiguous()
 
     return feature
+
+
+class Transform_Net(nn.Module):
+    def __init__(self, args):
+        super(Transform_Net, self).__init__()
+
+        self.k = args.k
+
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+
+        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   self.bn1,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv2 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False),
+                                   self.bn2,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv3 = nn.Sequential(nn.Conv1d(128, 1024, kernel_size=1, bias=False),
+                                   self.bn3,
+                                   nn.LeakyReLU(negative_slope=0.2))
+
+        self.linear1 = nn.Linear(1024, 512, bias=False)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.linear2 = nn.Linear(512, 256, bias=False)
+        self.bn5 = nn.BatchNorm1d(256)
+
+        self.transform = nn.Linear(256, 3*3)
+        nn.init.constant_(self.transform.weight, 0)
+        nn.init.eye_(self.transform.bias.view(3, 3))
+
+    def forward(self, x):
+        # x (B x 3 x N)
+        batch_size = x.size(0)
+        # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
+        t = get_graph_feature(x, k=self.k)
+
+        # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
+        t = self.conv1(t)
+        # (batch_size, 64, num_points, k) -> (batch_size, 128, num_points, k)
+        t = self.conv2(t)
+        # (batch_size, 128, num_points, k) -> (batch_size, 128, num_points)
+        t = t.max(dim=-1, keepdim=False)[0]
+
+        # (batch_size, 128, num_points) -> (batch_size, 1024, num_points)
+        t = self.conv3(t)
+        # (batch_size, 1024, num_points) -> (batch_size, 1024)
+        t = t.max(dim=-1, keepdim=False)[0]
+
+        # (batch_size, 1024) -> (batch_size, 512)
+        t = F.leaky_relu(self.bn4(self.linear1(t)), negative_slope=0.2)
+        # (batch_size, 512) -> (batch_size, 256)
+        t = F.leaky_relu(self.bn5(self.linear2(t)), negative_slope=0.2)
+
+        # (batch_size, 256) -> (batch_size, 3*3)
+        t = self.transform(t)
+        # (batch_size, 3*3) -> (batch_size, 3, 3)
+        t = t.view(batch_size, 3, 3)
+
+        # (batch_size, 3, num_points) -> (batch_size, num_points, 3)
+        x = x.transpose(2, 1).contiguous()
+        # (batch_size, num_points, 3) * (batch_size, 3, 3) -> (batch_size, num_points, 3)
+        x = torch.bmm(x, t)
+        # (batch_size, num_points, 3) -> (batch_size, 3, num_points)
+        x = x.transpose(2, 1).contiguous()
+        return x
+
+
+class DGCNN(nn.Module):
+    def __init__(self, args):
+        super(DGCNN, self).__init__()
+        self.k = args.k
+        self.emb_dim = args.emb_dim
+
+        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   nn.BatchNorm2d(64),
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv2 = nn.Sequential(nn.Conv2d(64, 64, kernel_size=1, bias=False),
+                                   nn.BatchNorm2d(64),
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv3 = nn.Sequential(nn.Conv2d(64*2, 64, kernel_size=1, bias=False),
+                                   nn.BatchNorm2d(64),
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv4 = nn.Sequential(nn.Conv2d(64, 64, kernel_size=1, bias=False),
+                                   nn.BatchNorm2d(64),
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv5 = nn.Sequential(nn.Conv2d(64*2, 64, kernel_size=1, bias=False),
+                                   nn.BatchNorm2d(64),
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv6 = nn.Sequential(nn.Conv1d(64*3, args.emb_dim, kernel_size=1, bias=False),
+                                   nn.BatchNorm1d(args.emb_dim),
+                                   nn.LeakyReLU(negative_slope=0.2))
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        num_points = x.size(2)
+
+        # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
+        x = get_graph_feature(x, k=self.k)
+        # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
+        x = self.conv1(x)
+        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points, k)
+        x = self.conv2(x)
+        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+        x1 = x.max(dim=-1, keepdim=False)[0]
+
+        # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+        x = get_graph_feature(x1, k=self.k)
+        # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
+        x = self.conv3(x)
+        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points, k)
+        x = self.conv4(x)
+        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+        x2 = x.max(dim=-1, keepdim=False)[0]
+
+        # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+        x = get_graph_feature(x2, k=self.k)
+        # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
+        x = self.conv5(x)
+        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+        x3 = x.max(dim=-1, keepdim=False)[0]
+
+        # (batch_size, 64*3, num_points)
+        x = torch.cat((x1, x2, x3), dim=1)
+        # (batch_size, 64*3, num_points) -> (batch_size, emb_dims, num_points)
+        y = self.conv6(x)
+        # (batch_size, num_points, emb_dims)
+        # y = y.view(batch_size, num_points, self.emb_dim)
+
+        return y
+
 
 
 def get_gradients(x, k, do_pca=False):
@@ -69,7 +202,10 @@ def get_gradients(x, k, do_pca=False):
     else:
         mean = x_nn.mean(dim=2).unsqueeze(dim=2)
         centered = x_nn - mean
-        _, _, v = torch.linalg.svd(centered)  # BxNxkx3 -> BxNx3x3
+        # _, _, v = torch.linalg.svd(centered)  # BxNxkx3 -> BxNx3x3
+        _, _, v = np.linalg.svd(centered.detach().cpu().numpy(), full_matrices=False)
+        v = torch.from_numpy(v)
+        v = v.cuda(int(os.environ["LOCAL_RANK"]))
     gradients = v[:, :, 0]  # BxNx3x3 -> BxNx3
     return gradients
 
@@ -85,7 +221,8 @@ def pointer(src_embedding, tgt_embedding):
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    scores = torch.matmul(
+        query, key.transpose(-2, -1).contiguous()) / math.sqrt(d_k)
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
     p_attn = scores.softmax(dim=-1)
@@ -221,7 +358,8 @@ class MultiHeadedAttention(nn.Module):
 
         # 1) Do all the linear projections in batch from d_model => h x d_k
         query, key, value = [
-            lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+            lin(x).view(nbatches, -1, self.h,
+                        self.d_k).transpose(1, 2).contiguous()
             for lin, x in zip(self.linears, (query, key, value))
         ]
 
@@ -256,150 +394,23 @@ class PositionwiseFeedForward(nn.Module):
         return self.w_2(self.dropout(self.norm(F.relu(self.w_1(x)).transpose(2, 1).contiguous())).transpose(2, 1).contiguous())
 
 
-class Transform_Net(nn.Module):
-    def __init__(self, args):
-        super(Transform_Net, self).__init__()
-
-        self.k = args.k
-
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-
-        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
-                                   self.bn1,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv2 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False),
-                                   self.bn2,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv3 = nn.Sequential(nn.Conv1d(128, 1024, kernel_size=1, bias=False),
-                                   self.bn3,
-                                   nn.LeakyReLU(negative_slope=0.2))
-
-        self.linear1 = nn.Linear(1024, 512, bias=False)
-        self.bn4 = nn.BatchNorm1d(512)
-        self.linear2 = nn.Linear(512, 256, bias=False)
-        self.bn5 = nn.BatchNorm1d(256)
-
-        self.transform = nn.Linear(256, 3*3)
-        nn.init.constant_(self.transform.weight, 0)
-        nn.init.eye_(self.transform.bias.view(3, 3))
-
-    def forward(self, x):
-        # x (B x 3 x N)
-        batch_size = x.size(0)
-        # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
-        t = get_graph_feature(x, k=self.k)
-
-        # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
-        t = self.conv1(t)
-        # (batch_size, 64, num_points, k) -> (batch_size, 128, num_points, k)
-        t = self.conv2(t)
-        # (batch_size, 128, num_points, k) -> (batch_size, 128, num_points)
-        t = t.max(dim=-1, keepdim=False)[0]
-
-        # (batch_size, 128, num_points) -> (batch_size, 1024, num_points)
-        t = self.conv3(t)
-        # (batch_size, 1024, num_points) -> (batch_size, 1024)
-        t = t.max(dim=-1, keepdim=False)[0]
-
-        # (batch_size, 1024) -> (batch_size, 512)
-        t = F.leaky_relu(self.bn4(self.linear1(t)), negative_slope=0.2)
-        # (batch_size, 512) -> (batch_size, 256)
-        t = F.leaky_relu(self.bn5(self.linear2(t)), negative_slope=0.2)
-
-        # (batch_size, 256) -> (batch_size, 3*3)
-        t = self.transform(t)
-        # (batch_size, 3*3) -> (batch_size, 3, 3)
-        t = t.view(batch_size, 3, 3)
-
-        # (batch_size, 3, num_points) -> (batch_size, num_points, 3)
-        x = x.transpose(2, 1)
-        # (batch_size, num_points, 3) * (batch_size, 3, 3) -> (batch_size, num_points, 3)
-        x = torch.bmm(x, t)
-        # (batch_size, num_points, 3) -> (batch_size, 3, num_points)
-        x = x.transpose(2, 1)
-        return x
-
-
-class DGCNN(nn.Module):
-    def __init__(self, args):
-        super(DGCNN, self).__init__()
-        self.k = args.k
-        self.emb_dim = args.emb_dim
-
-        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
-                                   nn.BatchNorm2d(64),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv2 = nn.Sequential(nn.Conv2d(64, 64, kernel_size=1, bias=False),
-                                   nn.BatchNorm2d(64),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv3 = nn.Sequential(nn.Conv2d(64*2, 64, kernel_size=1, bias=False),
-                                   nn.BatchNorm2d(64),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv4 = nn.Sequential(nn.Conv2d(64, 64, kernel_size=1, bias=False),
-                                   nn.BatchNorm2d(64),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv5 = nn.Sequential(nn.Conv2d(64*2, 64, kernel_size=1, bias=False),
-                                   nn.BatchNorm2d(64),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv6 = nn.Sequential(nn.Conv1d(64*3, args.emb_dim, kernel_size=1, bias=False),
-                                   nn.BatchNorm1d(args.emb_dim),
-                                   nn.LeakyReLU(negative_slope=0.2))
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        num_points = x.size(2)
-
-        # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
-        x = get_graph_feature(x, k=self.k)
-        # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
-        x = self.conv1(x)
-        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points, k)
-        x = self.conv2(x)
-        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
-        x1 = x.max(dim=-1, keepdim=False)[0]
-
-        # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
-        x = get_graph_feature(x1, k=self.k)
-        # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
-        x = self.conv3(x)
-        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points, k)
-        x = self.conv4(x)
-        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
-        x2 = x.max(dim=-1, keepdim=False)[0]
-
-        # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
-        x = get_graph_feature(x2, k=self.k)
-        # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
-        x = self.conv5(x)
-        # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
-        x3 = x.max(dim=-1, keepdim=False)[0]
-
-        # (batch_size, 64*3, num_points)
-        x = torch.cat((x1, x2, x3), dim=1)
-        # (batch_size, 64*3, num_points) -> (batch_size, emb_dims, num_points)
-        y = self.conv6(x)
-        # (batch_size, num_points, emb_dims)
-        # y = y.view(batch_size, num_points, self.emb_dim)
-
-        return y
-
-
 class MLPHead(nn.Module):
     def __init__(self, args):
         super(MLPHead, self).__init__()
-        emb_dims = args.emb_dims
+        emb_dims = args.emb_dim
         self.emb_dims = emb_dims
         self.nn = nn.Sequential(nn.Conv1d(emb_dims * 2, emb_dims // 2, 1),
                                 nn.BatchNorm1d(emb_dims // 2),
                                 nn.ReLU(),
+                                nn.Dropout(p=args.dropout),
                                 nn.Conv1d(emb_dims // 2, emb_dims // 4, 1),
                                 nn.BatchNorm1d(emb_dims // 4),
                                 nn.ReLU(),
+                                nn.Dropout(p=args.dropout),
                                 nn.Conv1d(emb_dims // 4, emb_dims // 8, 1),
                                 nn.BatchNorm1d(emb_dims // 8),
                                 nn.ReLU(),
+                                nn.Dropout(p=args.dropout),
                                 nn.Conv1d(emb_dims // 8, args.nclasses, 1)
                                 )
 
@@ -411,13 +422,13 @@ class MLPHead(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, args):
         super(Transformer, self).__init__()
-        self.emb_dims = args.emb_dims
+        self.emb_dims = args.emb_dim
         self.N = args.n_blocks
         self.dropout = args.dropout
         self.ff_dims = args.ff_dims
         self.n_heads = args.n_heads
         c = copy.deepcopy
-        attn = MultiHeadedAttention(self.n_heads, self.emb_dims)
+        attn = MultiHeadedAttention(self.n_heads, self.emb_dims, self.dropout)
         ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
         self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),
                                     Decoder(DecoderLayer(self.emb_dims, c(attn), c(attn),
