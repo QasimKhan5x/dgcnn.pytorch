@@ -244,7 +244,10 @@ def get_gradients(x, k, do_pca=False):
         # _, _, v = torch.linalg.svd(centered)  # BxNxkx3 -> BxNx3x3
         _, _, v = np.linalg.svd(centered.detach().cpu().numpy(), full_matrices=False)
         v = torch.from_numpy(v)
-        v = v.cuda(int(os.environ["LOCAL_RANK"]))
+        if "LOCAL_RANK" in os.environ:
+            v = v.cuda(int(os.environ["LOCAL_RANK"]))
+        else:
+            v = v.cuda()
     gradients = v[:, :, 0]  # BxNx3x3 -> BxNx3
     return gradients
 

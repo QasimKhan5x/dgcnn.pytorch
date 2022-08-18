@@ -373,13 +373,13 @@ def load_checkpoint(path, args, train_dl_size):
 
 
 def test(args, io):
-    test_loader = DataLoader(ShapeNetPart(partition='test', num_points=args.num_points, class_choice=args.class_choice),
-                             batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    test_ds = ShapeNetPart_Augmented(partition="test")
+    test_loader = prepare_dl(test_ds, drop_last=False, shuffle=False,
+                             batch_size=args.test_batch_size)
     device = torch.device("cuda" if args.cuda else "cpu")
     
     #Try to load models
-    seg_num_all = test_loader.dataset.seg_num_all
-    seg_start_index = test_loader.dataset.seg_start_index
+    seg_start_index = 0
     partseg_colors = test_loader.dataset.partseg_colors
     model = Net(args).to(device)
 
@@ -387,7 +387,6 @@ def test(args, io):
     model.load_state_dict(torch.load(args.model_path))
     model = model.eval()
     test_acc = 0.0
-    count = 0.0
     test_true_cls = []
     test_pred_cls = []
     test_true_seg = []

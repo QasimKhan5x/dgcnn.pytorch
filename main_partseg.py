@@ -19,7 +19,7 @@ import sklearn.metrics as metrics
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from plyfile import PlyData
+from plyfile import PlyData, PlyElement
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, StepLR
 from torch.utils.data import DataLoader
 
@@ -333,19 +333,13 @@ def test(args, io):
     device = torch.device("cuda" if args.cuda else "cpu")
 
     #Try to load models
-    seg_num_all = test_loader.dataset.seg_num_all
     seg_start_index = test_loader.dataset.seg_start_index
     partseg_colors = test_loader.dataset.partseg_colors
-    if args.model == 'dgcnn':
-        model = DGCNN_partseg(args, seg_num_all).to(device)
-    else:
-        raise Exception("Not implemented")
-
-    model = nn.DataParallel(model)
-    model.load_state_dict(torch.load(args.model_path))
+    model = Net(args).to(device)
+    model_path = f"outputs/{args.exp_name}/{args.model_path}"
+    model.load_state_dict(torch.load(model_path, map_location="cuda:0"))
     model = model.eval()
     test_acc = 0.0
-    count = 0.0
     test_true_cls = []
     test_pred_cls = []
     test_true_seg = []
@@ -360,8 +354,8 @@ def test(args, io):
         data, label_one_hot, seg = data.to(
             device), label_one_hot.to(device), seg.to(device)
         data = data.permute(0, 2, 1)
-        batch_size = data.size()[0]
-        seg_pred = model(data, label_one_hot)
+        with torch.no_grad():
+            seg_pred = model(data)
         seg_pred = seg_pred.permute(0, 2, 1).contiguous()
         pred = seg_pred.max(dim=2)[1]
         seg_np = seg.cpu().numpy()
@@ -386,8 +380,8 @@ def test(args, io):
     test_label_seg = np.concatenate(test_label_seg)
     test_ious = calculate_shape_IoU(
         test_pred_seg, test_true_seg, test_label_seg, args.class_choice)
-    outstr = 'Test :: test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (test_acc,
-                                                                             avg_per_class_acc,
+    outstr = 'Test: test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (test_acc,
+                                                                            avg_per_class_acc,
                                                                              np.mean(test_ious))
     io.cprint(outstr)
 
@@ -420,17 +414,19 @@ if __name__ == "__main__":
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
     parser.add_argument('--scheduler', type=str, default='cycle', metavar='N',
-                        choices=['cos', 'step'],
+                        choices=['cos', 'step', 'cycle'],
                         help='Scheduler to use, [cos, step]')
+    parser.add_argument('--use_custom_attention', action='store_true',
+                        help='use a custom attention mechanism for fusion')
     parser.add_argument('--no_cuda', type=bool, default=False,
                         help='enables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--ff_dims', type=int, default=256,
+    parser.add_argument('--ff_dims', type=int, default=512,
                         help='dimension of feed forward network inside transformer')
-    parser.add_argument('--n_heads', type=int, default=4,
+    parser.add_argument('--n_heads', type=int, default=1,
                         help='number of attention heads')
-    parser.add_argument('--n_blocks', type=int, default=4,
+    parser.add_argument('--n_blocks', type=int, default=1,
                         help='number of layers of encoder/decoder')
     parser.add_argument('--eval', type=bool,  default=False,
                         help='evaluate the model')
@@ -440,11 +436,11 @@ if __name__ == "__main__":
                         help='number of classes to predict')
     parser.add_argument('--dropout', type=float, default=0.5,
                         help='dropout rate')
-    parser.add_argument('--emb_dim', type=int, default=1024, metavar='N',
+    parser.add_argument('--emb_dim', type=int, default=512, metavar='N',
                         help='Dimension of embeddings')
-    parser.add_argument('--k', type=int, default=40, metavar='N',
+    parser.add_argument('--k', type=int, default=20, metavar='N',
                         help='Num of nearest neighbors to use')
-    parser.add_argument('--model_path', type=str, default='', metavar='N',
+    parser.add_argument('--model_path', type=str, default='models/transformer.pt', metavar='N',
                         help='Pretrained model path')
     parser.add_argument('--visu', type=str, default='',
                         help='visualize the model')
