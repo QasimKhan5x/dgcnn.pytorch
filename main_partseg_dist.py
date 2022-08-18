@@ -145,7 +145,7 @@ def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, cla
 def prepare_dl(dataset, drop_last, shuffle, batch_size, pin_memory=False, num_workers=0):
     '''split the dataloader to each process in the process group'''
     sampler = DistributedSampler(dataset, num_replicas=int(os.environ['WORLD_SIZE']),
-                                 rank=int(os.environ['RANK']), drop_last=drop_last)
+                                 rank=int(os.environ['LOCAL_RANK']), drop_last=drop_last)
     dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=pin_memory,
                             num_workers=num_workers, drop_last=drop_last,
                             sampler=sampler)
@@ -332,20 +332,28 @@ def train(args, io):
         io.cprint(outstr)
         if np.mean(test_ious) >= best_test_iou:
             best_test_iou = np.mean(test_ious)
-            torch.save(model.module.state_dict(),
-                       'outputs/%s/models/transformer.pt' % args.exp_name)
+            save_checkpoint(epoch, model, opt, scheduler, train_loss, args.exp_name, best=True)
         save_checkpoint(epoch, model, opt, scheduler, train_loss, args.exp_name)
         gc.collect()
         torch.cuda.empty_cache()
 
-def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name):
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.module.state_dict(),
-        'optimizer_state_dict': opt.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'loss': loss,
-    }, f'outputs/{exp_name}/ckpt.checkpoint')
+def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
+    if best:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.module.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': loss,
+        }, f'outputs/{exp_name}/models/transformer_{epoch}_loss_{loss:.2f}.checkpoint')
+    else:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.module.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': loss,
+        }, f'outputs/{exp_name}/ckpt_{epoch}_loss_{loss:.2f}.checkpoint')
 
 
 def load_checkpoint(path, args, train_dl_size):
@@ -483,25 +491,27 @@ if __name__ == "__main__":
                         help='Scheduler to use, [cos, step]')
     parser.add_argument('--no_cuda', type=bool, default=False,
                         help='enables CUDA training')
+    parser.add_argument('--use_custom_attention', action='store_true',
+                        help='use a custom attention mechanism for fusion')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--ff_dims', type=int, default=256,
+    parser.add_argument('--ff_dims', type=int, default=512,
                         help='dimension of feed forward network inside transformer')
+    parser.add_argument('--emb_dim', type=int, default=512, metavar='N',
+                        help='Dimension of embeddings')
     parser.add_argument('--n_heads', type=int, default=4,
                         help='number of attention heads')
-    parser.add_argument('--n_blocks', type=int, default=4,
+    parser.add_argument('--n_blocks', type=int, default=1,
                         help='number of layers of encoder/decoder')
     parser.add_argument('--eval', type=bool,  default=False,
                         help='evaluate the model')
     parser.add_argument('--num_points', type=int, default=2048,
                         help='num of points to use')
-    parser.add_argument('--nclasses', type=int, default=50,
+    parser.add_argument('--nclasses', type=int, default=50, 
                         help='number of classes to predict')
     parser.add_argument('--dropout', type=float, default=0.5,
                         help='dropout rate'),
-    parser.add_argument('--emb_dim', type=int, default=1024, metavar='N',
-                        help='Dimension of embeddings')
-    parser.add_argument('--k', type=int, default=40, metavar='N',
+    parser.add_argument('--k', type=int, default=20, metavar='N',
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_path', type=str, default='', metavar='N',
                         help='Pretrained model path')
