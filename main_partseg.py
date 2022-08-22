@@ -46,6 +46,8 @@ def _init_():
         os.makedirs('outputs/'+args.exp_name+'/'+'models')
     if not os.path.exists('outputs/'+args.exp_name+'/'+'visualization'):
         os.makedirs('outputs/'+args.exp_name+'/'+'visualization')
+    if not os.path.exists('outputs/'+args.exp_name+'/'+'checkpoints'):
+        os.makedirs('outputs/'+args.exp_name+'/'+'checkpoints')
     os.system('cp main_partseg.py outputs'+'/' +
               args.exp_name+'/'+'main_partseg.py.backup')
     os.system('cp model.py outputs' + '/' +
@@ -326,6 +328,7 @@ def train(args, io):
                        'outputs/%s/models/transformer.pt' % args.exp_name)
         gc.collect()
         torch.cuda.empty_cache()
+
 
 def test(args, io):
     test_loader = DataLoader(ShapeNetPart(partition='test', num_points=args.num_points, class_choice=args.class_choice),

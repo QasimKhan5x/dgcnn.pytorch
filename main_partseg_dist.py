@@ -48,6 +48,8 @@ def _init_():
         os.makedirs('outputs/'+args.exp_name+'/'+'models')
     if not os.path.exists('outputs/'+args.exp_name+'/'+'visualization'):
         os.makedirs('outputs/'+args.exp_name+'/'+'visualization')
+    if not os.path.exists('outputs/'+args.exp_name+'/'+'checkpoints'):
+        os.makedirs('outputs/'+args.exp_name+'/'+'checkpoints')
     os.system('cp main_partseg.py outputs'+'/'+args.exp_name+'/'+'main_partseg.py.backup')
     os.system('cp model.py outputs' + '/' + args.exp_name + '/' + 'model.py.backup')
     os.system('cp util.py outputs' + '/' + args.exp_name + '/' + 'util.py.backup')
@@ -142,55 +144,45 @@ def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, cla
             class_indexs[int(label[i])] = class_indexs[int(label[i])] + 1
 
 
-def prepare_dl(dataset, drop_last, shuffle, batch_size, pin_memory=False, num_workers=0):
+def prepare_dl(dataset, drop_last, batch_size, pin_memory, num_workers=0):
     '''split the dataloader to each process in the process group'''
-    sampler = DistributedSampler(dataset, num_replicas=int(os.environ['WORLD_SIZE']),
-                                 rank=int(os.environ['LOCAL_RANK']), drop_last=drop_last)
-    dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=pin_memory,
-                            num_workers=num_workers, drop_last=drop_last,
-                            sampler=sampler)
+    sampler = DistributedSampler(dataset, drop_last=drop_last)
+    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                            num_workers=num_workers, pin_memory=pin_memory)
     return dataloader
 
 
 def train(args, io):
-    # train_ds = torch.load("data/train_dataset.pt")
-    # test_ds = torch.load("data/test_dataset.pt")
     train_ds = ShapeNetPart_Augmented(partition="trainval")
     test_ds = ShapeNetPart_Augmented(partition="test")
     
     drop_last = len(train_ds) >= 100
+    ngpus_per_node = torch.cuda.device_count()
+    args.batch_size = int(args.batch_size / ngpus_per_node)
+    args.test_batch_size = int(args.test_batch_size / ngpus_per_node)
 
-    # train_loader = DataLoader(train_dataset, num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=drop_last)
-    # test_loader = DataLoader(test_dataset, num_workers=8,
-    #                          batch_size=args.test_batch_size, shuffle=True, drop_last=False)
-    train_loader = prepare_dl(train_ds, drop_last=drop_last, shuffle=True, batch_size=args.batch_size)
-    test_loader = prepare_dl(test_ds, drop_last=False, shuffle=False,
-                             batch_size=args.test_batch_size)
+    train_loader = prepare_dl(train_ds, drop_last=drop_last, batch_size=args.batch_size, pin_memory=True)
+    test_loader = prepare_dl(test_ds, drop_last=False, batch_size=args.test_batch_size, pin_memory=False)
     
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(local_rank)
 
     # Try to load models
-    # seg_num_all = train_loader.dataset.seg_num_all
-    # seg_start_index = train_loader.dataset.seg_start_index
     seg_num_all = 50
     seg_start_index = 0
     if args.model == 'transformer':
-        model = Net(args).to(device)
+        model = Net(args).cuda()
     else:
         raise Exception("Not implemented")
-
-    if os.path.isfile(f'outputs/{args.exp_name}/ckpt.checkpoint'):
+    
+    if os.path.isfile(f'outputs/{args.exp_name}/checkpoints/ckpt.checkpoint'):
         model, opt, scheduler = load_checkpoint(
             path=f'outputs/{args.exp_name}/ckpt.checkpoint',
             args=args,
             train_dl_size=len(train_loader))
     else:
         # Convert BatchNorm to SyncBatchNorm.
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-        # model = nn.DataParallel(model)
-        
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)        
         # wrap the model with DDP
         # device_ids tell DDP where is your model
         # output_device tells DDP where to output, in our case, it is rank
@@ -198,13 +190,13 @@ def train(args, io):
         model = DDP(model,
                     device_ids=[local_rank],
                     output_device=local_rank)
-        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        # print("Let's use", torch.cuda.device_count(), "GPUs!")
 
         if args.use_sgd:
-            print("Use SGD")
+            # print("Use SGD")
             opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
         else:
-            print("Use AdamW")
+            # print("Use AdamW")
             opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
         if args.scheduler == 'cos':
@@ -232,6 +224,11 @@ def train(args, io):
         train_true_seg = []
         train_pred_seg = []
         train_label_seg = []
+        # Mixed precision combines Floating Point (FP) 16 and FP 32 in different steps of the training.
+        # FP16 training is also known as half-precision training, which comes with inferior performance.
+        # Automatic mixed-precision is literally the best of both worlds:
+        # reduced training time with comparable performance to FP32
+        fp16_scaler = torch.cuda.amp.GradScaler(enabled=True)
         for data, label, seg in train_loader:
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
@@ -239,19 +236,23 @@ def train(args, io):
                 label_one_hot[idx, label[idx]] = 1
             label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
             data, label_one_hot, seg = \
-                data.to(device, non_blocking=True), \
-                label_one_hot.to(device, non_blocking=True), \
-                seg.to(device, non_blocking=True)
+                data.cuda(local_rank, non_blocking=True), \
+                label_one_hot.cuda(local_rank, non_blocking=True), \
+                seg.cuda(local_rank, non_blocking=True)
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()
-            seg_pred = model(data.contiguous())
-            seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-            loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
-            loss.backward()
-            opt.step()
+            # forward
+            with torch.cuda.amp.autocast():
+                seg_pred = model(data.contiguous())
+                seg_pred = seg_pred.permute(0, 2, 1).contiguous()
+                loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
+            fp16_scaler.scale(loss).backward()
+            fp16_scaler.step(opt)
             if args.scheduler == 'cycle':
                 scheduler.step()
+                # fp16_scaler.step(scheduler)
+            fp16_scaler.update()
             pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
             count += batch_size
             train_loss += loss.item() * batch_size
@@ -337,6 +338,7 @@ def train(args, io):
         gc.collect()
         torch.cuda.empty_cache()
 
+
 def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
     if best:
         torch.save({
@@ -345,7 +347,7 @@ def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
             'optimizer_state_dict': opt.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'loss': loss,
-        }, f'outputs/{exp_name}/models/transformer_{epoch}_loss_{loss:.2f}.checkpoint')
+        }, f'outputs/{exp_name}/models/transformer_{epoch}.checkpoint')
     else:
         torch.save({
             'epoch': epoch,
@@ -353,7 +355,7 @@ def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
             'optimizer_state_dict': opt.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'loss': loss,
-        }, f'outputs/{exp_name}/ckpt_{epoch}_loss_{loss:.2f}.checkpoint')
+        }, f'outputs/{exp_name}/checkpoints/ckpt_{epoch}.checkpoint')
 
 
 def load_checkpoint(path, args, train_dl_size):
@@ -369,7 +371,6 @@ def load_checkpoint(path, args, train_dl_size):
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[int(os.environ["LOCAL_RANK"])])
     return model, opt, scheduler
-
 
 
 def test(args, io):
@@ -429,26 +430,32 @@ def test(args, io):
                                                                              np.mean(test_ious))
     io.cprint(outstr)
 
+
 def main(args):
     io = IOStream('outputs/' + args.exp_name + '/run.log')
     io.cprint(str(args))
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)  # before your code runs
+    args.world_size = int(os.environ["WORLD_SIZE"])
+    args.local_rank = int(os.environ["LOCAL_RANK"])
+    args.rank = int(os.environ['RANK'])
+    ngpus_per_node = torch.cuda.device_count()
+    args.world_size = ngpus_per_node * args.world_size
+
+    torch.cuda.set_device(args.local_rank)  # before your code runs
     torch.manual_seed(args.seed)
-    if args.cuda:
-        io.cprint(
-            'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
-        torch.cuda.manual_seed(args.seed)
-    else:
-        io.cprint('Using CPU')
+    io.cprint(
+        'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
+    torch.cuda.manual_seed(args.seed)
 
 
     # setup the process group
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group('nccl', init_method='env://')
+    # dist.init_process_group('nccl', init_method='env://', 
+    #                         world_size=args.world_size,
+    #                         rank=args.rank)
+    dist.init_process_group('nccl')
 
     if not args.eval:
         train(args, io)
