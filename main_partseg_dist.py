@@ -194,7 +194,8 @@ def train(args, io):
 
         if args.use_sgd:
             # print("Use SGD")
-            opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
+            opt = optim.SGD(model.parameters(), lr=args.lr*100,
+                            momentum=args.momentum, weight_decay=1e-4)
         else:
             # print("Use AdamW")
             opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -204,17 +205,22 @@ def train(args, io):
         elif args.scheduler == 'step':
             scheduler = StepLR(opt, step_size=20, gamma=0.5)
         else:
-            scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
+            scheduler = OneCycleLR(
+                opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
 
     criterion = cal_loss
 
     best_test_iou = 0
+    # Mixed precision combines Floating Point (FP) 16 and FP 32 in different steps of the training.
+    # FP16 training is also known as half-precision training, which comes with inferior performance.
+    # Automatic mixed-precision is literally the best of both worlds:
+    # reduced training time with comparable performance to FP32
+    fp16_scaler = torch.cuda.amp.GradScaler(enabled=True)
     for epoch in range(args.epochs):
         ####################
         # Train
         ####################
-        train_loss = 0.0
-        count = 0.0
+        ddp_train_loss = torch.zeros(2).to(torch.device(local_rank))
         # if we are using DistributedSampler, we have to tell it which epoch this is
         train_loader.sampler.set_epoch(epoch)
         test_loader.sampler.set_epoch(epoch)
@@ -224,11 +230,6 @@ def train(args, io):
         train_true_seg = []
         train_pred_seg = []
         train_label_seg = []
-        # Mixed precision combines Floating Point (FP) 16 and FP 32 in different steps of the training.
-        # FP16 training is also known as half-precision training, which comes with inferior performance.
-        # Automatic mixed-precision is literally the best of both worlds:
-        # reduced training time with comparable performance to FP32
-        fp16_scaler = torch.cuda.amp.GradScaler(enabled=True)
         for data, label, seg in train_loader:
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
@@ -244,9 +245,10 @@ def train(args, io):
             opt.zero_grad()
             # forward
             with torch.cuda.amp.autocast():
-                seg_pred = model(data.contiguous())
+                seg_pred = model(data.contiguous(), label_one_hot.contiguous())
                 seg_pred = seg_pred.permute(0, 2, 1).contiguous()
                 loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
+                ddp_train_loss[0] += loss.item()
             fp16_scaler.scale(loss).backward()
             fp16_scaler.step(opt)
             if args.scheduler == 'cycle':
@@ -254,8 +256,7 @@ def train(args, io):
                 # fp16_scaler.step(scheduler)
             fp16_scaler.update()
             pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
-            count += batch_size
-            train_loss += loss.item() * batch_size
+            ddp_train_loss[1] += batch_size
             seg_np = seg.cpu().numpy()                  # (batch_size, num_points)
             pred_np = pred.detach().cpu().numpy()       # (batch_size, num_points)
             train_true_cls.append(seg_np.reshape(-1))       # (batch_size * num_points)
@@ -279,18 +280,20 @@ def train(args, io):
         train_pred_seg = np.concatenate(train_pred_seg, axis=0)
         train_label_seg = np.concatenate(train_label_seg)
         train_ious = calculate_shape_IoU(train_pred_seg, train_true_seg, train_label_seg, args.class_choice)
-        outstr = 'Train %d, loss: %.6f, train acc: %.6f, train avg acc: %.6f, train iou: %.6f' % (epoch, 
-                                                                                                  train_loss*1.0/count,
-                                                                                                  train_acc,
-                                                                                                  avg_per_class_acc,
-                                                                                                  np.mean(train_ious))
-        io.cprint(outstr)
+        dist.all_reduce(ddp_train_loss, op=dist.ReduceOp.SUM)
+        if local_rank == 0:            
+            outstr = 'Train %d, loss: %.6f, train acc: %.6f, train avg acc: %.6f, train iou: %.6f' % (epoch,
+                                                                                                      ddp_train_loss[0] / ddp_train_loss[1],
+                                                                                                      train_acc,
+                                                                                                      avg_per_class_acc,
+                                                                                                      np.mean(train_ious))
+            io.cprint(outstr)
         gc.collect()
         torch.cuda.empty_cache()
         ####################
         # Test
         ####################
-        count = 0.0
+        ddp_test_loss = torch.zeros(2).to(torch.device(local_rank))
         model.eval()
         test_true_cls = []
         test_pred_cls = []
@@ -307,10 +310,13 @@ def train(args, io):
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             with torch.no_grad():
-                seg_pred = model(data)
-            seg_pred = seg_pred.permute(0, 2, 1).contiguous()
+                seg_pred = model(data, label_one_hot)
+                seg_pred = seg_pred.permute(0, 2, 1).contiguous()
+                loss = criterion(seg_pred.view(-1, seg_num_all),
+                                seg.view(-1, 1).squeeze())
+            ddp_test_loss[0] += loss.item()
+            ddp_test_loss[1] += batch_size
             pred = seg_pred.max(dim=2)[1]
-            count += batch_size
             seg_np = seg.cpu().numpy()
             pred_np = pred.detach().cpu().numpy()
             test_true_cls.append(seg_np.reshape(-1))
@@ -326,15 +332,25 @@ def train(args, io):
         test_pred_seg = np.concatenate(test_pred_seg, axis=0)
         test_label_seg = np.concatenate(test_label_seg)
         test_ious = calculate_shape_IoU(test_pred_seg, test_true_seg, test_label_seg, args.class_choice)
-        outstr = 'Test %d, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
-                                                                                  test_acc,
-                                                                                  avg_per_class_acc,
-                                                                                  np.mean(test_ious))
-        io.cprint(outstr)
+        dist.all_reduce(ddp_test_loss, op=dist.ReduceOp.SUM)
+        if local_rank == 0:
+            outstr = 'Test %d, loss: %.6f, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
+                                                                                                  ddp_test_loss[0] /
+                                                                                                  ddp_test_loss[1],
+                                                                                                  test_acc,
+                                                                                                  avg_per_class_acc,
+                                                                                                  np.mean(test_ious))
+            # outstr = 'Test %d, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
+            #                                                                         test_acc,
+            #                                                                         avg_per_class_acc,
+            #                                                                         np.mean(test_ious))
+            io.cprint(outstr)
         if np.mean(test_ious) >= best_test_iou:
             best_test_iou = np.mean(test_ious)
-            save_checkpoint(epoch, model, opt, scheduler, train_loss, args.exp_name, best=True)
-        save_checkpoint(epoch, model, opt, scheduler, train_loss, args.exp_name)
+            save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
+                            ddp_test_loss[1], args.exp_name, best=True)
+        save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
+                        ddp_test_loss[1], args.exp_name)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -375,8 +391,7 @@ def load_checkpoint(path, args, train_dl_size):
 
 def test(args, io):
     test_ds = ShapeNetPart_Augmented(partition="test")
-    test_loader = prepare_dl(test_ds, drop_last=False, shuffle=False,
-                             batch_size=args.test_batch_size)
+    test_loader = prepare_dl(test_ds, drop_last=False, batch_size=args.test_batch_size, pin_memory=False)
     device = torch.device("cuda" if args.cuda else "cpu")
     
     #Try to load models
@@ -433,14 +448,16 @@ def test(args, io):
 
 def main(args):
     io = IOStream('outputs/' + args.exp_name + '/run.log')
-    io.cprint(str(args))
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     args.world_size = int(os.environ["WORLD_SIZE"])
     args.local_rank = int(os.environ["LOCAL_RANK"])
     args.rank = int(os.environ['RANK'])
-    ngpus_per_node = torch.cuda.device_count()
-    args.world_size = ngpus_per_node * args.world_size
+    # ngpus_per_node = torch.cuda.device_count()
+    # args.world_size = ngpus_per_node * args.world_size
+
+    if args.local_rank == 0:
+        io.cprint(str(args))
 
     torch.cuda.set_device(args.local_rank)  # before your code runs
     torch.manual_seed(args.seed)
@@ -468,7 +485,7 @@ if __name__ == "__main__":
 
     # Training settings
     parser = argparse.ArgumentParser(
-        description='Point Cloud Part Segmentation')
+        description='Point Cloud Segmentation')
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
     parser.add_argument('--model', type=str, default='transformer', metavar='N',
