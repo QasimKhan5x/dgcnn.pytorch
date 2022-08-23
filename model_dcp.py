@@ -141,6 +141,81 @@ def get_gradients(x, k, do_pca=False):
     return gradients
 
 
+def compute_hog_1x1(x, k, use_cpu=False):
+    '''
+    Compute histogram of oriented gradients using cell size of 1
+    so that every point gets information of its neighbors
+
+    x (B x 3 x N)
+    k (number of nbrs to consider)
+    '''
+    batch_size = x.size(0)
+    num_pts = x.size(2)
+
+    nn_idx = knn(x, k).view(-1)
+    # B x N x k x 3
+    x_nn = x.view(batch_size * num_pts, -
+                  1)[nn_idx, :].view(batch_size, num_pts, k, 3)
+    # center the pointcloud
+    mean = x_nn.mean(dim=2).unsqueeze(dim=2)
+    centered = x_nn - mean
+    # perform svd to obtain gradients & magnitudes
+    # considering s as mag because |v|=1
+    _, s, v = np.linalg.svd(
+        centered.detach().cpu().numpy(), full_matrices=False)
+    # convert to tensors
+    v = torch.from_numpy(v)
+    s = torch.from_numpy(np.sqrt(s))
+    # move to appropriate device
+    if "LOCAL_RANK" in os.environ:
+        v = v.cuda(int(os.environ["LOCAL_RANK"]))
+        s = s.cuda(int(os.environ["LOCAL_RANK"]))
+    elif not use_cpu:
+        v = v.cuda()
+        s = s.cuda()
+    # get the first element (largest variance)
+    gradients = v[:, :, 0]  # BxNx3x3 -> BxNx3
+    magnitudes = s[:, :, 0].unsqueeze(-1)  # BxNx3 -> BxNx1
+
+    # orient grads and mags into knn shape
+    gradients_nn = gradients.view(
+        batch_size * num_pts, -1)[nn_idx, :].view(batch_size, num_pts, k, 3)
+    magnitudes_nn = magnitudes.view(
+        batch_size * num_pts, -1)[nn_idx, :].view(batch_size, num_pts, k, 1)
+    # compute angles
+    zenith = torch.acos(gradients_nn[:, :, :, 2]).unsqueeze(-1) * 180 / np.pi
+    azimuth = torch.atan(
+        gradients_nn[:, :, :, 1] / gradients_nn[:, :, :, 0]).unsqueeze(-1) * 180 / np.pi
+    # stack into cells (zenith, azimuth, magnitude)
+    cells = torch.cat((zenith.int(), azimuth.int(), magnitudes_nn), dim=-1)
+    # don't differentiate between signed and unsigned
+    cells[cells < 0] += 180
+    # init histogram
+    if use_cpu:
+        histogram = torch.zeros((batch_size, num_pts, 9, 2))
+    else:
+        if 'LOCAL_RANK' in os.environ:
+            histogram = torch.zeros((batch_size, num_pts, 9, 2), device=torch.device(
+                int(os.environ['LOCAL_RANK'])))
+        else:
+            histogram = torch.zeros(
+                (batch_size, num_pts, 9, 2), device=torch.device('cuda'))
+    # 20 degrees bins computed from angles
+    bins = torch.floor(cells[:, :, :, :2] / 20.0 - 0.5) % 9
+    first_centers = 20 * ((bins + 1) % 9 + 0.5)
+    first_votes = cells[:, :, :, 2].unsqueeze(-1) * \
+        ((first_centers - cells[:, :, :, :2]) % 180) / 20
+    second_centers = 20 * (bins + 0.5)
+    second_votes = cells[:, :, :, 2].unsqueeze(-1) * \
+        ((cells[:, :, :, :2] - second_centers) % 180) / 20
+    for c in range(9):
+        histogram[:, :, c] += (first_votes * (bins == c)).sum(dim=2)
+        histogram[:, :, (c+1) % 9] += (second_votes * (bins == c)).sum(dim=2)
+    histogram = F.normalize(histogram, p=2.0, dim=2)
+    histogram = histogram.view(batch_size, num_pts, -1)
+    return histogram
+
+
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
@@ -152,62 +227,6 @@ def attention(query, key, value, mask=None, dropout=None):
     if dropout is not None:
         p_attn = dropout(p_attn)
     return torch.matmul(p_attn, value), p_attn
-
-
-class PointTransformerLayer(nn.Module):
-    def __init__(self, d_points, d_model=64, k=16) -> None:
-        super(PointTransformerLayer, self).__init__()
-
-        self.k = k
-
-        self.fc1 = nn.Linear(d_points, d_model)
-        self.fc2 = nn.Linear(d_model, d_points)
-
-        self.fc_delta = nn.Sequential(
-            nn.Linear(3, d_model, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model)
-        )
-        self.fc_gamma = nn.Sequential(
-            nn.Linear(d_model, d_model, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model)
-        )
-        self.w_qs = nn.Linear(d_model, d_model, bias=False)
-        self.w_ks = nn.Linear(d_model, d_model, bias=False)
-        self.w_vs = nn.Linear(d_model, d_model, bias=False)
-
-    def _square_distance(self, src, dst):
-        return torch.sum((src[:, :, None] - dst[:, None]) ** 2, dim=-1)
-
-
-    def _index_points(self, points, idx):
-        raw_size = idx.size()
-        idx = idx.reshape(raw_size[0], -1)
-        res = torch.gather(
-            points, 1, idx[..., None].expand(-1, -1, points.size(-1)))
-        return res.reshape(*raw_size, -1)
-
-    def forward(self, xyz, features):
-        # xyz: b x n x 3, features: b x n x f
-        dists = self._square_distance(xyz, xyz)
-        knn_idx = dists.argsort()[:, :, :self.k]  # b x n x k
-        knn_xyz = self._index_points(xyz, knn_idx)
-
-        pre = features
-        x = self.fc1(features)
-        q, k, v = self.w_qs(x), self._index_points(
-            self.w_ks(x), knn_idx), self._index_points(self.w_vs(x), knn_idx)
-
-        pos_enc = self.fc_delta(xyz[:, :, None] - knn_xyz)  # b x n x k x f
-
-        attn = self.fc_gamma(q[:, :, None] - k + pos_enc)
-        attn = F.softmax(attn, dim=-2)  # b x n x k x f
-        attn = F.normalize(attn, p=1.0, dim=-2)
-
-        res = torch.einsum('bmnf,bmnf->bmf', attn, v + pos_enc)
-        res = self.fc2(res) + pre
-        return res
 
 
 class EncoderDecoder(nn.Module):
@@ -444,7 +463,7 @@ class Net(nn.Module):
         # self.tnet.load_state_dict(torch.load('ckpts/tnet.pt'))
         self.emb_nn = DGCNN(args)
         self.grads_emb = nn.Sequential(
-            nn.Linear(3, args.emb_dim),
+            nn.Linear(18, args.emb_dim),
             nn.ReLU(inplace=True)
         )
         # self.emb_nn.load_state_dict(torch.load('ckpts/dgcnn.pt'))
@@ -459,8 +478,8 @@ class Net(nn.Module):
         # src (batch_size, 3, num_points)
         # (batch_size, emb_dims, num_points)
         src_embedding = self.emb_nn(src)
-        # (batch_size, num_points, 3)
-        tgt = get_gradients(src, k=self.k)
+        # (batch_size, num_points, 9 * 2)
+        tgt = compute_hog_1x1(src, k=self.k)
         # (batch_size, emb_dims, num_points)
         tgt_embedding = self.grads_emb(tgt).transpose(1, 2).contiguous()
         # (batch_size, emb_dims, num_points)
