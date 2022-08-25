@@ -101,11 +101,7 @@ class PointTransformerLayer(nn.Module):
 
         self.to_qkv = nn.Linear(input_dim, inner_dim * 3, bias=False)
 
-        self.pos_mlp = nn.Sequential(
-            nn.Linear(3, pos_mlp_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(pos_mlp_hidden_dim, inner_dim)
-        )
+        self.pos_resize = nn.Linear(3, inner_dim)
 
         self.attn_mlp = nn.Sequential(
             nn.Linear(inner_dim, inner_dim * attn_mlp_hidden_mult),
@@ -115,7 +111,7 @@ class PointTransformerLayer(nn.Module):
 
         self.reshape = nn.Linear(inner_dim, input_dim)
 
-    def forward(self, x, mask, pos, ):
+    def forward(self, x, pos, canonical, mask=None):
 
         bs, n, num_neighbors = x.shape[0], x.shape[1], self.num_neighbors
 
@@ -124,7 +120,7 @@ class PointTransformerLayer(nn.Module):
 
         # calculate relative positional embeddings
         idx = knn(pos, k=num_neighbors).view(-1)
-        pos_nn = pos.contiguous().view(bs * n, -1)[idx,
+        pos_nn = canonical.contiguous().view(bs * n, -1)[idx,
                                       :].view(bs, n, num_neighbors, 3)
         pos_repeat = pos.contiguous().view(bs, n, 1, 3).repeat(1, 1, num_neighbors, 1)
         rel_pos_emb = self.pos_mlp(pos_nn - pos_repeat) # B N K C
