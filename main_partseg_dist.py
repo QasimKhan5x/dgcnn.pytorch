@@ -230,7 +230,10 @@ def train(args, io):
         train_true_seg = []
         train_pred_seg = []
         train_label_seg = []
-        for data, label, seg in train_loader:
+
+        # batch accumulation parameter
+        accum_iter = 4
+        for batch_idx, (data, label, seg) in enumerate(train_loader):
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
             for idx in range(label.shape[0]):
@@ -248,12 +251,14 @@ def train(args, io):
                 seg_pred = model(data.contiguous(), label_one_hot.contiguous())
                 seg_pred = seg_pred.permute(0, 2, 1).contiguous()
                 loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
+                # normalize loss to account for batch accumulation
+                # loss /= accum_iter
                 ddp_train_loss[0] += loss.item()
             fp16_scaler.scale(loss).backward()
+            # if ((batch_idx + 1) % accum_iter == 0) or (batch_idx + 1 == len(train_loader)):
             fp16_scaler.step(opt)
             if args.scheduler == 'cycle':
                 scheduler.step()
-                # fp16_scaler.step(scheduler)
             fp16_scaler.update()
             pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
             ddp_train_loss[1] += batch_size
@@ -391,8 +396,13 @@ def load_checkpoint(path, args, train_dl_size):
 
 def test(args, io):
     test_ds = ShapeNetPart_Augmented(partition="test")
-    test_loader = prepare_dl(test_ds, drop_last=False, batch_size=args.test_batch_size, pin_memory=False)
-    device = torch.device("cuda" if args.cuda else "cpu")
+    ngpus_per_node = torch.cuda.device_count()
+    args.test_batch_size = int(args.test_batch_size / ngpus_per_node)
+    test_loader = prepare_dl(test_ds, drop_last=False, 
+                            batch_size=args.test_batch_size, pin_memory=False)
+    
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(local_rank)
     
     #Try to load models
     seg_start_index = 0
@@ -488,6 +498,8 @@ if __name__ == "__main__":
         description='Point Cloud Segmentation')
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
+    parser.add_argument('--seed', type=int, default=1, metavar='S',
+                        help='random seed (default: 1)')
     parser.add_argument('--model', type=str, default='transformer', metavar='N',
                         choices=['dgcnn', 'transformer'],
                         help='Model to use, [dgcnn]')
@@ -516,8 +528,6 @@ if __name__ == "__main__":
                         help='enables CUDA training')
     parser.add_argument('--use_custom_attention', action='store_true',
                         help='use a custom attention mechanism for fusion')
-    parser.add_argument('--seed', type=int, default=1, metavar='S',
-                        help='random seed (default: 1)')
     parser.add_argument('--ff_dims', type=int, default=512,
                         help='dimension of feed forward network inside transformer')
     parser.add_argument('--emb_dim', type=int, default=512, metavar='N',
@@ -526,14 +536,16 @@ if __name__ == "__main__":
                         help='number of attention heads')
     parser.add_argument('--n_blocks', type=int, default=1,
                         help='number of layers of encoder/decoder')
+    parser.add_argument('--d_qkv', type=int, default=64,
+                        help='dimension of q,k,v')
+    parser.add_argument('--dropout', type=float, default=0.5,
+                        help='dropout rate'),
     parser.add_argument('--eval', type=bool,  default=False,
                         help='evaluate the model')
     parser.add_argument('--num_points', type=int, default=2048,
                         help='num of points to use')
     parser.add_argument('--nclasses', type=int, default=50, 
                         help='number of classes to predict')
-    parser.add_argument('--dropout', type=float, default=0.5,
-                        help='dropout rate'),
     parser.add_argument('--k', type=int, default=20, metavar='N',
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_path', type=str, default='', metavar='N',

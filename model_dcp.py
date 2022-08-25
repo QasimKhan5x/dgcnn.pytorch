@@ -10,7 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from layers import PositionEmbedding
+
 # Part of the code is referred from: http://nlp.seas.harvard.edu/annotated-transformer/
+
 
 
 def clones(module, N):
@@ -95,7 +98,8 @@ class DGCNN(nn.Module):
 
     def forward(self, x):
         batch_size, num_dims, num_points = x.size()
-
+        
+        # B C N K
         x = get_graph_feature(x, k=self.k)
         x = self.conv1(x)
         x1 = x.max(dim=-1, keepdim=False)[0]
@@ -118,29 +122,6 @@ class DGCNN(nn.Module):
         return x
 
 
-def get_gradients(x, k, do_pca=False):
-    '''
-    x (Bx3xN) batch of point clouds
-    return gradients (BxNx3): direction of maximimal variance at each point
-    '''
-    x_nn = get_graph_feature(x, k=k, knn_only=True)  # Bx3xN -> BxNxkx3
-    if do_pca:
-        _, _, v = torch.pca_lowrank(x_nn)  # BxNxkx3 -> BxNx3x3
-
-    else:
-        mean = x_nn.mean(dim=2).unsqueeze(dim=2)
-        centered = x_nn - mean
-        # _, _, v = torch.linalg.svd(centered)  # BxNxkx3 -> BxNx3x3
-        _, _, v = np.linalg.svd(centered.detach().cpu().numpy(), full_matrices=False)
-        v = torch.from_numpy(v)
-        if "LOCAL_RANK" in os.environ:
-            v = v.cuda(int(os.environ["LOCAL_RANK"]))
-        else:
-            v = v.cuda()
-    gradients = v[:, :, 0]  # BxNx3x3 -> BxNx3
-    return gradients
-
-
 def compute_hog_1x1(x, k, use_cpu=False):
     '''
     Compute histogram of oriented gradients using cell size of 1
@@ -158,10 +139,10 @@ def compute_hog_1x1(x, k, use_cpu=False):
                                1)[nn_idx, :].view(batch_size, 
                                                   num_pts, k, 3)
     # center the pointcloud
-    mean = x_nn.mean(dim=2).unsqueeze(dim=2)
+    mean = x_nn.mean(dim=2, keepdim=True) # B x N x 1 x 3 
     centered = x_nn - mean
     # perform svd to obtain gradients & magnitudes
-    # considering s as mag because |v|=1
+    # considering s as mag because |v|=1 for all points
     _, s, v = np.linalg.svd(
         centered.detach().cpu().numpy(), full_matrices=False)
     # convert to tensors
@@ -204,13 +185,15 @@ def compute_hog_1x1(x, k, use_cpu=False):
     # 20 degrees bins computed from angles
     bins = torch.floor(cells[:, :, :, :2] / 20.0 - 0.5) % 9
     # vote for bin i
-    first_centers = 20 * ((bins + 1) % 9 + 0.5)
+    width = 20.0
+    num_bins = 9
+    first_centers = width * ((bins + 1) % num_bins + 0.5)
     first_votes = cells[:, :, :, 2].unsqueeze(-1) * \
-        ((first_centers - cells[:, :, :, :2]) % 180) / 20
-    # vote for bin (i + 1) % 9
-    second_centers = 20 * (bins + 0.5)
+        ((first_centers - cells[:, :, :, :2]) % 180) / width
+    # vote for next bin
+    second_centers = width * (bins + 0.5)
     second_votes = cells[:, :, :, 2].unsqueeze(-1) * \
-        ((cells[:, :, :, :2] - second_centers) % 180) / 20
+        ((cells[:, :, :, :2] - second_centers) % 180) / width
     for c in range(9):
         histogram[:, :, c] += (first_votes * (bins == c)).sum(dim=2)
         histogram[:, :, (c+1) % 9] += (second_votes * (bins == c)).sum(dim=2)
@@ -220,7 +203,7 @@ def compute_hog_1x1(x, k, use_cpu=False):
 
 
 def attention(query, key, value, mask=None, dropout=None):
-    "Compute 'Scaled Dot Product Attention'"
+    """Compute 'Scaled Dot Product Attention'"""
     d_k = query.size(-1)
     scores = torch.matmul(
         query, key.transpose(-2, -1).contiguous()) / math.sqrt(d_k)
@@ -229,7 +212,8 @@ def attention(query, key, value, mask=None, dropout=None):
     p_attn = scores.softmax(dim=-1)
     if dropout is not None:
         p_attn = dropout(p_attn)
-    return torch.matmul(p_attn, value), p_attn
+    scaled_values = torch.matmul(p_attn, value)
+    return scaled_values, p_attn
 
 
 class EncoderDecoder(nn.Module):
@@ -264,13 +248,15 @@ class Encoder(nn.Module):
     def __init__(self, layer, N):
         super(Encoder, self).__init__()
         self.layers = clones(layer, N)
-        self.norm = nn.LayerNorm(layer.size)
+        self.norm = nn.BatchNorm1d(layer.size)
 
     def forward(self, x, mask):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
             x = layer(x, mask)
-        return self.norm(x)
+        x = self.norm(x.transpose(1, 2).contiguous()
+                      ).transpose(1, 2).contiguous()
+        return x
 
 
 class Decoder(nn.Module):
@@ -279,12 +265,14 @@ class Decoder(nn.Module):
     def __init__(self, layer, N):
         super(Decoder, self).__init__()
         self.layers = clones(layer, N)
-        self.norm = nn.LayerNorm(layer.size)
+        self.norm = nn.BatchNorm1d(layer.size)
 
     def forward(self, x, memory, src_mask, tgt_mask):
         for layer in self.layers:
             x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
+        x = self.norm(x.transpose(1, 2).contiguous()
+                      ).transpose(1, 2).contiguous()
+        return x
 
 
 class SublayerConnection(nn.Module):
@@ -295,12 +283,14 @@ class SublayerConnection(nn.Module):
 
     def __init__(self, size, dropout):
         super(SublayerConnection, self).__init__()
-        self.norm = nn.LayerNorm(size)
+        self.norm = nn.BatchNorm1d(size)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
-        return x + self.dropout(sublayer(self.norm(x)))
+        x = self.norm(x.transpose(1, 2).contiguous()
+                      ).transpose(1, 2).contiguous()
+        return x + self.dropout(sublayer(x))
 
 
 class EncoderLayer(nn.Module):
@@ -315,7 +305,6 @@ class EncoderLayer(nn.Module):
 
     def forward(self, x, mask):
         "Follow Figure 1 (left) for connections."
-        # TODO: replace vaswani attention with point transformer
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
         return self.sublayer[1](x, self.feed_forward)
 
@@ -331,7 +320,7 @@ class DecoderLayer(nn.Module):
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 3)
 
-    def forward(self, x, memory, src_mask, tgt_mask):
+    def forward(self, x, memory, src_mask, tgt_mask, pointcloud=None):
         "Follow Figure 1 (right) for connections."
         m = memory
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
@@ -396,62 +385,6 @@ class PositionwiseFeedForward(nn.Module):
         return self.w_2(self.dropout(self.norm(F.leaky_relu(self.w_1(x), 0.1).transpose(2, 1).contiguous())).transpose(2, 1).contiguous())
 
 
-class MLPHead(nn.Module):
-    def __init__(self, args):
-        super(MLPHead, self).__init__()
-        emb_dims = args.emb_dim
-        self.nn = nn.Sequential(nn.Conv1d(emb_dims * 5 + 64, emb_dims // 2, 1, bias=False),
-                                nn.BatchNorm1d(emb_dims // 2),
-                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                nn.Dropout(p=args.dropout),
-                                nn.Conv1d(emb_dims // 2, emb_dims // 4, 1, bias=False),
-                                nn.BatchNorm1d(emb_dims // 4),
-                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                nn.Dropout(p=args.dropout),
-                                nn.Conv1d(emb_dims // 4, emb_dims //
-                                          8, 1, bias=False),
-                                nn.BatchNorm1d(emb_dims // 8),
-                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                nn.Dropout(p=args.dropout),
-                                nn.Conv1d(emb_dims // 8, args.nclasses, 1)
-                                )
-        self.label_conv = nn.Sequential(nn.Conv1d(16, 64, kernel_size=1, bias=False),
-                                        nn.BatchNorm1d(64),
-                                        nn.LeakyReLU(negative_slope=0.2)
-                                        )
-
-    def forward(self, *input):
-        # (batch_size, emb_dims, num_points)
-        src = input[0].transpose(1, 2)
-        # (batch_size, emb_dims, num_points)
-        tgt = input[1].transpose(1, 2)
-        # (batch_size, num_categories)
-        lbl = input[2]
-        # (batch_size, emb_dims, num_points)
-        attn = input[3].transpose(1, 2)
-
-        batch_size = src.size(0)
-        N = src.size(2)
-
-        # B x emb_dims x N  (emb_dims * 4 total)
-        src_max = src.max(dim=2, keepdim=True).repeat(1, 1, N)
-        tgt_max = tgt.max(dim=2, keepdim=True).repeat(1, 1, N)
-        src_mean = src.mean(dim=2, keepdim=True).repeat(1, 1, N)
-        tgt_mean = tgt.mean(dim=2, keepdim=True).repeat(1, 1, N)
-
-        # (batch_size, num_categories, 1)
-        lbl = lbl.unsqueeze(-1)
-        # (batch_size, num_categoties, 1) -> (batch_size, 64, 1)
-        lbl = self.label_conv(lbl)
-        # B x 64 x N
-        lbl = lbl.repeat(1, 1, N)
-        # (batch_size, emb_dim * 4 + 64, 2048)
-        x = torch.cat((src_max, tgt_max, src_mean, tgt_mean, lbl), dim=2)
-        # B x (emb_dim * 5 + 64) x 2048
-        x = torch.cat((x, attn), dim=1)
-        return self.nn(x)
-
-
 class Transformer(nn.Module):
     def __init__(self, args):
         super(Transformer, self).__init__()
@@ -477,16 +410,73 @@ class Transformer(nn.Module):
         src = input[0]
         # (batch_size, emb_dims, num_points)
         tgt = input[1]
+        # (batch_size, 3, num_points)
+        # pointcloud = input[2]
         # (batch_size, emb_dims, num_points)
         src = src.transpose(2, 1).contiguous()
         # (batch_size, emb_dims, num_points)
         tgt = tgt.transpose(2, 1).contiguous()
         # (batch_size, num_points, emb_dims)
-        tgt_embedding = self.model(src, tgt).transpose(2, 1).contiguous()
+        tgt_embedding = self.model(
+            src, tgt).transpose(2, 1).contiguous()
         # (batch_size, num_points, emb_dims)
-        src_embedding = self.model(tgt, src).transpose(2, 1).contiguous()
+        src_embedding = self.model(
+            tgt, src).transpose(2, 1).contiguous()
         # (batch_size, nclasses, num_points)
         return src_embedding, tgt_embedding
+
+
+class MLPHead(nn.Module):
+    def __init__(self, args):
+        super(MLPHead, self).__init__()
+        emb_dims = args.emb_dim
+        self.nn = nn.Sequential(nn.Conv1d(emb_dims * 5 + 64, emb_dims // 2, 1, bias=False),
+                                nn.BatchNorm1d(emb_dims // 2),
+                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                nn.Dropout(p=args.dropout),
+                                nn.Conv1d(emb_dims // 2, emb_dims //
+                                          4, 1, bias=False),
+                                nn.BatchNorm1d(emb_dims // 4),
+                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                nn.Dropout(p=args.dropout),
+                                nn.Conv1d(emb_dims // 4, emb_dims //
+                                          8, 1, bias=False),
+                                nn.BatchNorm1d(emb_dims // 8),
+                                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                nn.Dropout(p=args.dropout),
+                                nn.Conv1d(emb_dims // 8, args.nclasses, 1)
+                                )
+        self.label_conv = nn.Sequential(nn.Conv1d(16, 64, kernel_size=1, bias=False),
+                                        nn.BatchNorm1d(64),
+                                        nn.LeakyReLU(negative_slope=0.2)
+                                        )
+
+    def forward(self, *input):
+        # (batch_size, emb_dims, num_points)
+        src = input[0].transpose(1, 2)
+        # (batch_size, emb_dims, num_points)
+        tgt = input[1].transpose(1, 2)
+        # (batch_size, num_categories)
+        lbl = input[2]
+        # (batch_size, emb_dims, num_points)
+        attn = input[3].transpose(1, 2)
+
+        N = src.size(2)
+
+        # B x emb_dims x N  (emb_dims * 4 total)
+        src_max = src.max(dim=2, keepdim=True)[0].repeat(1, 1, N)
+        tgt_max = tgt.max(dim=2, keepdim=True)[0].repeat(1, 1, N)
+        src_mean = src.mean(dim=2, keepdim=True).repeat(1, 1, N)
+        tgt_mean = tgt.mean(dim=2, keepdim=True).repeat(1, 1, N)
+        # (batch_size, num_categories, 1)
+        lbl = lbl.unsqueeze(-1)
+        # (batch_size, num_categoties, 1) -> (batch_size, 64, 1)
+        lbl = self.label_conv(lbl)
+        # B x 64 x N
+        lbl = lbl.repeat(1, 1, N)
+        # (batch_size, emb_dim * 5 + 64, 2048)
+        x = torch.cat((src_max, tgt_max, src_mean, tgt_mean, lbl, attn), dim=1)
+        return self.nn(x)
 
 
 class Net(nn.Module):
@@ -496,16 +486,6 @@ class Net(nn.Module):
         # self.tnet = Transform_Net(args)
         # self.tnet.load_state_dict(torch.load('ckpts/tnet.pt'))
         self.emb_nn = DGCNN(args)
-        # self.grads_emb = nn.Sequential(
-        #     nn.Linear(18, args.emb_dim // 8),
-        #     nn.LeakyReLU(negative_slope=0.2, inplace=True),
-        #     nn.Linear(args.emb_dim // 8, args.emb_dim // 4),
-        #     nn.LeakyReLU(negative_slope=0.2, inplace=True),
-        #     nn.Linear(args.emb_dim // 8, args.emb_dim // 2),
-        #     nn.LeakyReLU(negative_slope=0.2, inplace=True),
-        #     nn.Linear(args.emb_dim // 2, args.emb_dim),
-        #     nn.LeakyReLU(negative_slope=0.2, inplace=True),
-        # )
         self.grads_emb = nn.Sequential(
             nn.Conv1d(18, args.emb_dim // 8, 1, bias=False),
             nn.BatchNorm1d(args.emb_dim // 8),
@@ -520,10 +500,16 @@ class Net(nn.Module):
             nn.BatchNorm1d(args.emb_dim),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
         )
-        # self.emb_nn.load_state_dict(torch.load('ckpts/dgcnn.pt'))
+        self.pos_mlp = nn.Sequential(
+            PositionEmbedding(args),
+            nn.Conv1d(3, args.emb_dim, 1, bias=False),
+            nn.BatchNorm1d(args.emb_dim),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        )
         self.transformer = Transformer(args)
         if args.use_custom_attention:
-            self.attention = MultiHeadedAttention(h=args.n_heads, d_model=args.emb_dim, dropout=args.dropout)
+            self.attention = MultiHeadedAttention(
+                h=args.n_heads, d_model=args.emb_dim, dropout=args.dropout)
         else:
             self.attention = None
         self.head = MLPHead(args)
@@ -537,13 +523,15 @@ class Net(nn.Module):
         # (batch_size, emb_dims, num_points)
         tgt_embedding = self.grads_emb(tgt.transpose(1, 2).contiguous())
         # (batch_size, emb_dims, num_points)
-        src_embedding_p, tgt_embedding_p = self.transformer(
-            src_embedding, tgt_embedding)
+        canonical = self.pos_mlp(src)
+        src_embedding = src_embedding + canonical
+        tgt_embedding = tgt_embedding + canonical
+        # (batch_size, emb_dims, num_points)
+        src_embedding_p, tgt_embedding_p = self.transformer(src_embedding, tgt_embedding)
         # (batch_size, num_points, emb_dims)
-        src_embedding = (src_embedding + src_embedding_p).transpose(1, 2).contiguous()
-        tgt_embedding = (tgt_embedding + tgt_embedding_p).transpose(1, 2).contiguous()
+        src_embedding = (src_embedding_p).transpose(1, 2).contiguous()
+        tgt_embedding = (tgt_embedding_p).transpose(1, 2).contiguous()
         # (batch_size, num_points, emb_dims)
-        # TODO replace with another fusion mechanism
         if self.attention is not None:
             scores = self.attention(
                 query=src_embedding, key=tgt_embedding, value=tgt_embedding)
