@@ -24,7 +24,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, StepLR
 from torch.utils.data import DataLoader
 
 from data import ShapeNetPart
-from model_dcp import Net
+from models.model_partseg import Net
 from util import IOStream, cal_loss
 
 class_indexs = np.zeros((16,), dtype=int)

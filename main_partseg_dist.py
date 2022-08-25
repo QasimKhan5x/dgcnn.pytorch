@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from data import ShapeNetPart_Augmented
-from model_dcp import Net
+from models.model_partseg import Net
 from util import IOStream, cal_loss
 
 class_indexs = np.zeros((16,), dtype=int)
