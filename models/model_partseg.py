@@ -13,7 +13,6 @@ from models.dgcnn import DGCNN, knn
 from models.layers import PositionEmbedding
 from models.transformer import Transformer
 
-# Part of the code is referred from: http://nlp.seas.harvard.edu/annotated-transformer/
 
 def compute_hog_1x1(x, k, use_cpu=False):
     '''

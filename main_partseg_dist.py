@@ -22,7 +22,7 @@ import torch.optim as optim
 from plyfile import PlyData, PlyElement
 from sklearn import metrics
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, StepLR
+from torch.optim.lr_scheduler import OneCycleLR  # type: ignore
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -200,13 +200,12 @@ def train(args, io):
             # print("Use AdamW")
             opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-        if args.scheduler == 'cos':
-            scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
-        elif args.scheduler == 'step':
-            scheduler = StepLR(opt, step_size=20, gamma=0.5)
-        else:
-            scheduler = OneCycleLR(
-                opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
+        # if args.scheduler == 'cos':
+        #     scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
+        # elif args.scheduler == 'step':
+        #     scheduler = StepLR(opt, step_size=20, gamma=0.5)
+        # else:
+        scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
 
     criterion = cal_loss
 
@@ -215,15 +214,15 @@ def train(args, io):
     # FP16 training is also known as half-precision training, which comes with inferior performance.
     # Automatic mixed-precision is literally the best of both worlds:
     # reduced training time with comparable performance to FP32
-    fp16_scaler = torch.cuda.amp.GradScaler(enabled=True)
+    fp16_scaler = torch.cuda.amp.GradScaler(enabled=True)  # type: ignore
     for epoch in range(args.epochs):
         ####################
         # Train
         ####################
         ddp_train_loss = torch.zeros(2).to(torch.device(local_rank))
         # if we are using DistributedSampler, we have to tell it which epoch this is
-        train_loader.sampler.set_epoch(epoch)
-        test_loader.sampler.set_epoch(epoch)
+        train_loader.sampler.set_epoch(epoch)  # type: ignore
+        test_loader.sampler.set_epoch(epoch)  # type: ignore
         model.train()
         train_true_cls = []
         train_pred_cls = []
@@ -247,14 +246,14 @@ def train(args, io):
             batch_size = data.size()[0]
             opt.zero_grad()
             # forward
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast():  # type: ignore
                 seg_pred = model(data.contiguous(), label_one_hot.contiguous())
                 seg_pred = seg_pred.permute(0, 2, 1).contiguous()
                 loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
                 # normalize loss to account for batch accumulation
                 # loss /= accum_iter
                 ddp_train_loss[0] += loss.item()
-            fp16_scaler.scale(loss).backward()
+            fp16_scaler.scale(loss).backward()  # type: ignore
             # if ((batch_idx + 1) % accum_iter == 0) or (batch_idx + 1 == len(train_loader)):
             fp16_scaler.step(opt)
             if args.scheduler == 'cycle':

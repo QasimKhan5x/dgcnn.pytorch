@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from models.attention import MultiHeadedAttention
 
+# Part of the code is referred from: http://nlp.seas.harvard.edu/annotated-transformer/
 
 def clones(module, N):
     "Produce N identical layers."

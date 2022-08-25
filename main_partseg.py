@@ -11,21 +11,17 @@
 from __future__ import print_function
 
 import argparse
-import gc
 import os
 
 import numpy as np
 import sklearn.metrics as metrics
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from plyfile import PlyData, PlyElement
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, StepLR
 from torch.utils.data import DataLoader
 
 from data import ShapeNetPart
 from models.model_partseg import Net
-from util import IOStream, cal_loss
+from util import IOStream
 
 class_indexs = np.zeros((16,), dtype=int)
 global visual_warning
@@ -156,178 +152,6 @@ def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, cla
                       (visu_format))
                 exit()
             class_indexs[int(label[i])] = class_indexs[int(label[i])] + 1
-
-
-def train(args, io):
-    train_dataset = ShapeNetPart(
-        partition='trainval', num_points=args.num_points, class_choice=args.class_choice)
-    test_dataset = ShapeNetPart(partition='test', num_points=args.num_points,
-                 class_choice=args.class_choice)
-
-    drop_last = len(train_dataset) >= 100
-    if len(train_dataset) < 100:
-        drop_last = False
-    else:
-        drop_last = True
-    train_loader = DataLoader(train_dataset, num_workers=8, batch_size=args.batch_size,
-                             shuffle=True, drop_last=drop_last)
-    test_loader = DataLoader(test_dataset, num_workers=8, 
-                            batch_size=args.test_batch_size, shuffle=True, drop_last=False)
-
-    device = torch.device("cuda" if args.cuda else "cpu")
-
-    #Try to load models
-    seg_num_all = train_loader.dataset.seg_num_all
-    seg_start_index = train_loader.dataset.seg_start_index
-    model = Net(args).to(device)
-    model = nn.DataParallel(model)
-
-    if args.use_sgd:
-        print("Use SGD")
-        opt = optim.SGD(model.parameters(), lr=args.lr*100,
-                        momentum=args.momentum, weight_decay=1e-4)
-    else:
-        print("Use Adam")
-        opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    if args.scheduler == 'cos':
-        scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
-    elif args.scheduler == 'step':
-        scheduler = StepLR(opt, step_size=20, gamma=0.5)
-    else:
-        scheduler = OneCycleLR(opt, 
-                               max_lr=args.lr*100,
-                               epochs=200, 
-                               steps_per_epoch=len(train_loader)
-                               )
-
-    criterion = cal_loss
-
-    best_test_iou = 0
-    for epoch in range(args.epochs):
-        ####################
-        # Train
-        ####################
-        train_loss = 0.0
-        count = 0.0
-        model.train()
-        train_true_cls = []
-        train_pred_cls = []
-        train_true_seg = []
-        train_pred_seg = []
-        train_label_seg = []
-        for data, label, seg in train_loader:
-            seg = seg - seg_start_index
-            label_one_hot = np.zeros((label.shape[0], 16))
-            for idx in range(label.shape[0]):
-                label_one_hot[idx, label[idx]] = 1
-            label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
-            data, label_one_hot, seg = data.to(
-                device), label_one_hot.to(device), seg.to(device)
-            data = data.permute(0, 2, 1)
-            batch_size = data.size()[0]
-            opt.zero_grad()
-            seg_pred = model(data.contiguous())
-            seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-            loss = criterion(seg_pred.view(-1, seg_num_all),
-                             seg.view(-1, 1).squeeze())
-            loss.backward()
-            opt.step()
-            if args.scheduler == 'cycle':
-                scheduler.step()
-            # (batch_size, num_points)
-            pred = seg_pred.max(dim=2)[1]
-            count += batch_size
-            train_loss += loss.item() * batch_size
-            seg_np = seg.cpu().numpy()                  # (batch_size, num_points)
-            pred_np = pred.detach().cpu().numpy()       # (batch_size, num_points)
-            # (batch_size * num_points)
-            train_true_cls.append(seg_np.reshape(-1))
-            # (batch_size * num_points)
-            train_pred_cls.append(pred_np.reshape(-1))
-            train_true_seg.append(seg_np)
-            train_pred_seg.append(pred_np)
-            train_label_seg.append(label.reshape(-1))
-        if args.scheduler == 'cos':
-            scheduler.step()
-        elif args.scheduler == 'step':
-            if opt.param_groups[0]['lr'] > 1e-5:
-                scheduler.step()
-            if opt.param_groups[0]['lr'] < 1e-5:
-                for param_group in opt.param_groups:
-                    param_group['lr'] = 1e-5
-        train_true_cls = np.concatenate(train_true_cls)
-        train_pred_cls = np.concatenate(train_pred_cls)
-        train_acc = metrics.accuracy_score(train_true_cls, train_pred_cls)
-        avg_per_class_acc = metrics.balanced_accuracy_score(
-            train_true_cls, train_pred_cls)
-        train_true_seg = np.concatenate(train_true_seg, axis=0)
-        train_pred_seg = np.concatenate(train_pred_seg, axis=0)
-        train_label_seg = np.concatenate(train_label_seg)
-        train_ious = calculate_shape_IoU(
-            train_pred_seg, train_true_seg, train_label_seg, args.class_choice)
-        outstr = 'Train %d, loss: %.6f, train acc: %.6f, train avg acc: %.6f, train iou: %.6f' % (epoch,
-                                                                                                  train_loss*1.0/count,
-                                                                                                  train_acc,
-                                                                                                  avg_per_class_acc,
-                                                                                                  np.mean(train_ious))
-        io.cprint(outstr)
-        gc.collect()
-        torch.cuda.empty_cache()
-        ####################
-        # Test
-        ####################
-        count = 0.0
-        model.eval()
-        test_true_cls = []
-        test_pred_cls = []
-        test_true_seg = []
-        test_pred_seg = []
-        test_label_seg = []
-        for data, label, seg in test_loader:
-            seg = seg - seg_start_index
-            label_one_hot = np.zeros((label.shape[0], 16))
-            for idx in range(label.shape[0]):
-                label_one_hot[idx, label[idx]] = 1
-            label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
-            data, label_one_hot, seg = data.to(
-                device), label_one_hot.to(device), seg.to(device)
-            data = data.permute(0, 2, 1)
-            batch_size = data.size()[0]
-            with torch.no_grad():
-                seg_pred = model(data)
-            seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-            pred = seg_pred.max(dim=2)[1]
-            count += batch_size
-            seg_np = seg.cpu().numpy()
-            pred_np = pred.detach().cpu().numpy()
-            test_true_cls.append(seg_np.reshape(-1))
-            test_pred_cls.append(pred_np.reshape(-1))
-            test_true_seg.append(seg_np)
-            test_pred_seg.append(pred_np)
-            test_label_seg.append(label.reshape(-1))
-        test_true_cls = np.concatenate(test_true_cls)
-        test_pred_cls = np.concatenate(test_pred_cls)
-        test_acc = metrics.accuracy_score(test_true_cls, test_pred_cls)
-        avg_per_class_acc = metrics.balanced_accuracy_score(
-            test_true_cls, test_pred_cls)
-        test_true_seg = np.concatenate(test_true_seg, axis=0)
-        test_pred_seg = np.concatenate(test_pred_seg, axis=0)
-        test_label_seg = np.concatenate(test_label_seg)
-        test_ious = calculate_shape_IoU(
-            test_pred_seg, test_true_seg, test_label_seg, args.class_choice)
-        outstr = 'Test %d, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
-                                                                                  test_acc,
-                                                                                  avg_per_class_acc,
-                                                                                  np.mean(test_ious)
-                                                                                  )
-        io.cprint(outstr)
-        if np.mean(test_ious) >= best_test_iou:
-            best_test_iou = np.mean(test_ious)
-            torch.save(model.state_dict(),
-                       'outputs/%s/models/transformer.pt' % args.exp_name)
-        gc.collect()
-        torch.cuda.empty_cache()
 
 
 def test(args, io):
@@ -465,7 +289,4 @@ if __name__ == "__main__":
     else:
         io.cprint('Using CPU')
 
-    if not args.eval:
-        train(args, io)
-    else:
-        test(args, io)
+    test(args, io)
