@@ -27,8 +27,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from data import ShapeNetPart_Augmented
+from loss import cross_entropy
 from models.model_partseg import Net
-from util import IOStream, cal_loss
+from util import IOStream
 
 class_indexs = np.zeros((16,), dtype=int)
 global visual_warning
@@ -50,7 +51,13 @@ def _init_():
         os.makedirs('outputs/'+args.exp_name+'/'+'visualization')
     if not os.path.exists('outputs/'+args.exp_name+'/'+'checkpoints'):
         os.makedirs('outputs/'+args.exp_name+'/'+'checkpoints')
+    if not os.path.exists('outputs/'+args.exp_name+'/'+'backups'):
+        os.makedirs('outputs/'+args.exp_name+'/'+'backups')
     os.system('cp main_partseg.py outputs'+'/'+args.exp_name+'/'+'main_partseg.py.backup')
+    os.system('cp loss.py outputs'+'/' +
+              args.exp_name+'/'+'loss.py.backup')
+    os.system('cp models/* outputs'+'/' +
+              args.exp_name+'/'+'backups/')
 
 
 def calculate_shape_IoU(pred_np, seg_np, label, class_choice, visual=False):
@@ -204,7 +211,7 @@ def train(args, io):
         # else:
         scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
 
-    criterion = cal_loss
+    criterion = cross_entropy
 
     best_test_iou = 0
     # Mixed precision combines Floating Point (FP) 16 and FP 32 in different steps of the training.

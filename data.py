@@ -387,7 +387,10 @@ class S3DIS(Dataset):
 
 
 if __name__ == '__main__':
-    print("hello world")
+    # print("hello world")
+    download_modelnet40()
+    download_S3DIS()
+
     # train = ModelNet40(1024)
     # test = ModelNet40(1024, 'test')
     # data, label = train[0]
