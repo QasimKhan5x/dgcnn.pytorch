@@ -3,7 +3,7 @@ import copy
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.attention import MultiHeadedAttention
+from models.attention import VectorAttention
 
 # Part of the code is referred from: http://nlp.seas.harvard.edu/annotated-transformer/
 
@@ -18,24 +18,21 @@ class EncoderDecoder(nn.Module):
     other models.
     """
 
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+    def __init__(self, encoder, decoder):
         super(EncoderDecoder, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
 
-    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+
+    def forward(self, src, tgt, pointcloud):
         "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask,
-                           tgt, tgt_mask)
+        return self.decode(self.encode(src, pointcloud), tgt, pointcloud)
 
-    def encode(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
+    def encode(self, src, pointcloud):
+        return self.encoder(src, pointcloud)
 
-    def decode(self, memory, src_mask, tgt, tgt_mask):
-        return self.generator(self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask))
+    def decode(self, memory, tgt, pointcloud):
+        return self.decoder(tgt, memory, pointcloud)
 
 
 class Encoder(nn.Module):
@@ -46,10 +43,10 @@ class Encoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = nn.BatchNorm1d(layer.size)
 
-    def forward(self, x, mask):
+    def forward(self, x, pointcloud):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x, pointcloud)
         x = self.norm(x.transpose(1, 2).contiguous()
                       ).transpose(1, 2).contiguous()
         return x
@@ -63,9 +60,9 @@ class Decoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = nn.BatchNorm1d(layer.size)
 
-    def forward(self, x, memory, src_mask, tgt_mask):
+    def forward(self, x, memory, pointcloud):
         for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
+            x = layer(x, memory, pointcloud)
         x = self.norm(x.transpose(1, 2).contiguous()
                       ).transpose(1, 2).contiguous()
         return x
@@ -99,9 +96,9 @@ class EncoderLayer(nn.Module):
         self.sublayer = clones(SublayerConnection(size, dropout), 2)
         self.size = size
 
-    def forward(self, x, mask):
+    def forward(self, x, pointcloud):
         "Follow Figure 1 (left) for connections."
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, pointcloud))
         return self.sublayer[1](x, self.feed_forward)
 
 
@@ -116,11 +113,11 @@ class DecoderLayer(nn.Module):
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 3)
 
-    def forward(self, x, memory, src_mask, tgt_mask, pointcloud=None):
+    def forward(self, x, memory, pointcloud):
         "Follow Figure 1 (right) for connections."
         m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, pointcloud))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, pointcloud))
         return self.sublayer[2](x, self.feed_forward)
 
 
@@ -135,7 +132,10 @@ class PositionwiseFeedForward(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
-        return self.w_2(self.dropout(self.norm(F.leaky_relu(self.w_1(x), 0.1).transpose(2, 1).contiguous())).transpose(2, 1).contiguous())
+        return self.w_2(self.dropout(self.norm(F.leaky_relu(self.w_1(x),
+         0.1).transpose(2,
+          1).contiguous())).transpose(2,
+           1).contiguous())
 
 
 class Transformer(nn.Module):
@@ -148,15 +148,13 @@ class Transformer(nn.Module):
         self.n_heads = args.n_heads
 
         c = copy.deepcopy
-        attn = MultiHeadedAttention(self.n_heads, self.emb_dims, self.dropout)
+        attn = VectorAttention(args)
         ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
 
         self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),
                                     Decoder(DecoderLayer(self.emb_dims, c(attn), c(attn),
-                                                         c(ff), self.dropout), self.N),
-                                    nn.Sequential(),
-                                    nn.Sequential(),
-                                    nn.Sequential())
+                                                         c(ff), self.dropout), self.N)
+                                    )
 
     def forward(self, *input):
         # (batch_size, emb_dims, num_points)
@@ -164,16 +162,16 @@ class Transformer(nn.Module):
         # (batch_size, emb_dims, num_points)
         tgt = input[1]
         # (batch_size, 3, num_points)
-        # pointcloud = input[2]
+        pointcloud = input[2]
         # (batch_size, emb_dims, num_points)
         src = src.transpose(2, 1).contiguous()
         # (batch_size, emb_dims, num_points)
         tgt = tgt.transpose(2, 1).contiguous()
         # (batch_size, num_points, emb_dims)
         tgt_embedding = self.model(
-            src, tgt).transpose(2, 1).contiguous()
+            src, tgt, pointcloud).transpose(2, 1).contiguous()
         # (batch_size, num_points, emb_dims)
         src_embedding = self.model(
-            tgt, src).transpose(2, 1).contiguous()
+            tgt, src, pointcloud).transpose(2, 1).contiguous()
         # (batch_size, nclasses, num_points)
         return src_embedding, tgt_embedding

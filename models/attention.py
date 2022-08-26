@@ -1,9 +1,12 @@
-import math
 import copy
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+
+from models.dgcnn import knn
 
 
 def clones(module, N):
@@ -68,168 +71,185 @@ class MultiHeadedAttention(nn.Module):
         return self.linears[-1](x)
 
 
-class EncoderDecoder(nn.Module):
-    """
-    A standard Encoder-Decoder architecture. Base for this and many
-    other models.
-    """
+class VectorAttention(nn.Module):
+    def __init__(
+        self,
+        args,
+        pos_mlp_hidden_dim=64,
+        attn_mlp_hidden_mult=4,
+    ):
+        super(VectorAttention, self).__init__()
+        inner_dim = args.d_qkv
 
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
-        super(EncoderDecoder, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
+        self.num_neighbors = args.k
+        self.size = args.emb_dim
 
-    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
-        "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask,
-                           tgt, tgt_mask)
+        self.w_q = nn.Linear(args.emb_dim, inner_dim, bias=False)
+        self.w_k = nn.Linear(args.emb_dim, inner_dim, bias=False)
+        self.w_v = nn.Linear(args.emb_dim, inner_dim, bias=False)
 
-    def encode(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
+        self.to_out = nn.Linear(inner_dim, args.emb_dim)
 
-    def decode(self, memory, src_mask, tgt, tgt_mask):
-        return self.generator(self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask))
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, pos_mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(pos_mlp_hidden_dim, inner_dim)
+        )
 
+        attn_inner_dim = inner_dim * attn_mlp_hidden_mult
 
-class Encoder(nn.Module):
-    "Core encoder is a stack of N layers"
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(inner_dim, attn_inner_dim),
+            nn.ReLU(),
+            nn.Linear(attn_inner_dim, inner_dim),
+        )
 
-    def __init__(self, layer, N):
-        super(Encoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = nn.BatchNorm1d(layer.size)
+    def forward(self, query, key, value, canonical, mask=None):
+        bs, n, num_neighbors = query.shape[0], query.shape[1], self.num_neighbors
 
-    def forward(self, x, mask):
-        "Pass the input (and mask) through each layer in turn."
-        for layer in self.layers:
-            x = layer(x, mask)
-        x = self.norm(x.transpose(1, 2).contiguous()
-                      ).transpose(1, 2).contiguous()
-        return x
+        # get queries, keys, values (B x N x D)
 
+        q, k, v = self.w_q(query), self.w_k(key), self.w_v(value)
 
-class Decoder(nn.Module):
-    "Generic N layer decoder with masking."
+        # calculate relative positional embeddings
+        idx = knn(canonical, k=num_neighbors).view(-1)
+        pos_nn = canonical.contiguous().view(bs * n, -1)[idx,
+                                                         :].view(bs, n, num_neighbors, 3)
+        pos_repeat = canonical.contiguous().view(
+            bs, n, 1, 3).repeat(1, 1, num_neighbors, 1)
+        # B N K C
+        rel_pos_emb = self.pos_mlp(pos_nn - pos_repeat)
 
-    def __init__(self, layer, N):
-        super(Decoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = nn.BatchNorm1d(layer.size)
+        # use subtraction of queries to keys. i suppose this is a better inductive bias for point clouds than dot product
 
-    def forward(self, x, memory, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        x = self.norm(x.transpose(1, 2).contiguous()
-                      ).transpose(1, 2).contiguous()
-        return x
+        q = q.contiguous().view(
+            bs * n, -1)[idx, :].view(bs, n, num_neighbors, -1)
+        k = k.contiguous().view(
+            bs * n, -1)[idx, :].view(bs, n, num_neighbors, -1)
+        # b n k c
+        qk_rel = q - k
 
+        # expand values (B x N x C) -> (B x N x k x C)
+        v = v.contiguous().view(
+            bs * n, -1)[idx, :].view(bs, n, num_neighbors, -1)
 
-class SublayerConnection(nn.Module):
-    """
-    A residual connection followed by a layer norm.
-    Note for code simplicity the norm is first as opposed to last.
-    """
+        # add relative positional embeddings to value
+        v = v + rel_pos_emb
 
-    def __init__(self, size, dropout):
-        super(SublayerConnection, self).__init__()
-        self.norm = nn.BatchNorm1d(size)
-        self.dropout = nn.Dropout(dropout)
+        # use attention mlp, making sure to add relative positional embedding first
 
-    def forward(self, x, sublayer):
-        "Apply residual connection to any sublayer with the same size."
-        x = self.norm(x.transpose(1, 2).contiguous()
-                      ).transpose(1, 2).contiguous()
-        return x + self.dropout(sublayer(x))
+        sim = self.attn_mlp(qk_rel + rel_pos_emb)
 
+        # attention
+        
+        attn = sim.softmax(dim=-1)
+        attn = F.normalize(attn, dim=-2)
 
-class EncoderLayer(nn.Module):
-    "Encoder is made up of self-attn and feed forward (defined below)"
+        # aggregate
 
-    def __init__(self, size, self_attn, feed_forward, dropout):
-        super(EncoderLayer, self).__init__()
-        self.self_attn = self_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 2)
-        self.size = size
+        agg = torch.einsum('b i j d, b i j d -> b i d', attn, v).contiguous()
 
-    def forward(self, x, mask):
-        "Follow Figure 1 (left) for connections."
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
-        return self.sublayer[1](x, self.feed_forward)
+        # combine heads
+
+        del q
+        del k
+        del v
+        return self.to_out(agg)
 
 
-class DecoderLayer(nn.Module):
-    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
+class MultiHeadVectorAttention(nn.Module):
+    def __init__(
+        self,
+        args,
+        dim_head=64,
+        pos_mlp_hidden_dim=64,
+        attn_mlp_hidden_mult=4,
+    ):
+        super(MultiHeadVectorAttention, self).__init__()
+        self.heads = args.n_heads
+        inner_dim = dim_head * self.heads
 
-    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
-        super(DecoderLayer, self).__init__()
-        self.size = size
-        self.self_attn = self_attn
-        self.src_attn = src_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+        self.num_neighbors = args.k
+        self.size = args.emb_dim
 
-    def forward(self, x, memory, src_mask, tgt_mask, pointcloud=None):
-        "Follow Figure 1 (right) for connections."
-        m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
-        return self.sublayer[2](x, self.feed_forward)
+        self.w_q = nn.Linear(args.emb_dim, inner_dim, bias=False)
+        self.w_k = nn.Linear(args.emb_dim, inner_dim, bias=False)
+        self.w_v = nn.Linear(args.emb_dim, inner_dim, bias=False)
 
+        self.to_out = nn.Linear(inner_dim, args.emb_dim)
 
-class PositionwiseFeedForward(nn.Module):
-    "Implements FFN equation."
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, pos_mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(pos_mlp_hidden_dim, inner_dim)
+        )
 
-    def __init__(self, d_model, d_ff, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.norm = nn.BatchNorm1d(d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
-        self.dropout = nn.Dropout(p=dropout)
+        attn_inner_dim = inner_dim * attn_mlp_hidden_mult
 
-    def forward(self, x):
-        return self.w_2(self.dropout(self.norm(F.leaky_relu(self.w_1(x), 0.1).transpose(2, 1).contiguous())).transpose(2, 1).contiguous())
+        self.attn_mlp = nn.Sequential(
+            nn.Conv2d(inner_dim, attn_inner_dim, 1, groups=self.heads),
+            nn.ReLU(),
+            nn.Conv2d(attn_inner_dim, inner_dim, 1, groups=self.heads),
+        )
 
+    def forward(self, query, key, value, canonical, mask=None):
+        bs, n, h, num_neighbors = query.shape[0], query.shape[1], self.heads, self.num_neighbors
 
-class Transformer(nn.Module):
-    def __init__(self, args):
-        super(Transformer, self).__init__()
-        self.emb_dims = args.emb_dim
-        self.N = args.n_blocks
-        self.dropout = args.dropout
-        self.ff_dims = args.ff_dims
-        self.n_heads = args.n_heads
+        # get queries, keys, values
 
-        c = copy.deepcopy
-        attn = MultiHeadedAttention(self.n_heads, self.emb_dims, self.dropout)
-        ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
+        q, k, v = self.w_q(query), self.w_k(key), self.w_v(value)
 
-        self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),
-                                    Decoder(DecoderLayer(self.emb_dims, c(attn), c(attn),
-                                                         c(ff), self.dropout), self.N),
-                                    nn.Sequential(),
-                                    nn.Sequential(),
-                                    nn.Sequential())
+        # split out heads
 
-    def forward(self, *input):
-        # (batch_size, emb_dims, num_points)
-        src = input[0]
-        # (batch_size, emb_dims, num_points)
-        tgt = input[1]
-        # (batch_size, 3, num_points)
-        # pointcloud = input[2]
-        # (batch_size, emb_dims, num_points)
-        src = src.transpose(2, 1).contiguous()
-        # (batch_size, emb_dims, num_points)
-        tgt = tgt.transpose(2, 1).contiguous()
-        # (batch_size, num_points, emb_dims)
-        tgt_embedding = self.model(
-            src, tgt).transpose(2, 1).contiguous()
-        # (batch_size, num_points, emb_dims)
-        src_embedding = self.model(
-            tgt, src).transpose(2, 1).contiguous()
-        # (batch_size, nclasses, num_points)
-        return src_embedding, tgt_embedding
+        q, k, v = map(lambda t: rearrange(
+            t, 'b n (h d) -> b h n d', h=h), (q, k, v))
+
+        # calculate relative positional embeddings
+        idx = knn(canonical, k=num_neighbors).view(-1)
+        pos_nn = canonical.contiguous().view(bs * n, -1)[idx,
+                                                   :].view(bs, n, num_neighbors, 3)
+        pos_repeat = canonical.contiguous().view(
+            bs, n, 1, 3).repeat(1, 1, num_neighbors, 1)
+        rel_pos_emb = self.pos_mlp(pos_nn - pos_repeat)  # B N K C
+
+        # split out heads for rel pos emb
+
+        rel_pos_emb = rearrange(rel_pos_emb, 'b i j (h d) -> b h i j d', h=h)
+
+        # use subtraction of queries to keys. i suppose this is a better inductive bias for point clouds than dot product
+
+        q = q.contiguous().view(
+            bs * n, -1)[idx, :].view(bs, h, n, num_neighbors, -1)
+        k = k.contiguous().view(
+            bs * n, -1)[idx, :].view(bs, h, n, num_neighbors, -1)
+        qk_rel = q - k
+
+        # expand values (B x N x C) -> (B x N x k x C)
+        v = v.contiguous().view(
+            bs * n, -1)[idx, :].view(bs, h, n, num_neighbors, -1)
+
+        # add relative positional embeddings to value
+        v = v + rel_pos_emb
+
+        # use attention mlp, making sure to add relative positional embedding first
+
+        attn_mlp_input = qk_rel + rel_pos_emb
+        attn_mlp_input = rearrange(attn_mlp_input, 'b h i j d -> b (h d) i j')
+
+        sim = self.attn_mlp(attn_mlp_input)
+
+        # attention
+        attn = sim.softmax(dim=-1)
+        attn = F.normalize(attn, dim=-2)
+
+        # aggregate
+
+        v = rearrange(v, 'b h i j d -> b i j (h d)')
+        agg = torch.einsum('b d i j, b i j d -> b i d', attn, v).contiguous()
+
+        # combine heads
+
+        del q
+        del k
+        del v
+        return self.to_out(agg)

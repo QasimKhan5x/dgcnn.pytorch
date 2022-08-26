@@ -51,9 +51,6 @@ def _init_():
     if not os.path.exists('outputs/'+args.exp_name+'/'+'checkpoints'):
         os.makedirs('outputs/'+args.exp_name+'/'+'checkpoints')
     os.system('cp main_partseg.py outputs'+'/'+args.exp_name+'/'+'main_partseg.py.backup')
-    os.system('cp model.py outputs' + '/' + args.exp_name + '/' + 'model.py.backup')
-    os.system('cp util.py outputs' + '/' + args.exp_name + '/' + 'util.py.backup')
-    os.system('cp data.py outputs' + '/' + args.exp_name + '/' + 'data.py.backup')
 
 
 def calculate_shape_IoU(pred_np, seg_np, label, class_choice, visual=False):
@@ -353,8 +350,6 @@ def train(args, io):
             best_test_iou = np.mean(test_ious)
             save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
                             ddp_test_loss[1], args.exp_name, best=True)
-        save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
-                        ddp_test_loss[1], args.exp_name)
         gc.collect()
         torch.cuda.empty_cache()
 
