@@ -362,7 +362,7 @@ class ShapeNetPart_Augmented(Dataset):
                 if choice.item():
                     pointcloud = func(pointcloud)
         return pointcloud, label, seg
-        
+
 
 class S3DIS(Dataset):
     def __init__(self, num_points=4096, partition='train', test_area='1'):
@@ -387,38 +387,4 @@ class S3DIS(Dataset):
 
 
 if __name__ == '__main__':
-    # print("hello world")
-    download_modelnet40()
-    download_S3DIS()
-
-    # train = ModelNet40(1024)
-    # test = ModelNet40(1024, 'test')
-    # data, label = train[0]
-    # print(data.shape)
-    # print(label.shape)
-
-    # download_shapenetpart()
-    # data, label, seg = load_data_partseg('trainval')
-    # train_ds = torch.utils.data.TensorDataset(torch.from_numpy(data),
-    #                                           torch.from_numpy(label),
-    #                                           torch.from_numpy(seg))
-
-    # data, label, seg = load_data_partseg('test')
-    # test_ds = torch.utils.data.TensorDataset(torch.from_numpy(data),
-    #                                         torch.from_numpy(label),
-    #                                         torch.from_numpy(seg))
-    # torch.save(train_ds, "train_dataset.pt")
-    # torch.save(test_ds, "test_dataset.pt")
-
-    # print(len(trainval))
-
-    # data, label, seg = trainval[0]
-    # print(data.shape)
-    # print(label.shape)
-    # print(seg.shape)
-
-    # train = S3DIS(4096)
-    # test = S3DIS(4096, 'test')
-    # data, seg = train[0]
-    # print(data.shape)
-    # print(seg.shape)
+    print("Running")

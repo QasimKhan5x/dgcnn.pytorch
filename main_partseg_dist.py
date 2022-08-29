@@ -198,21 +198,18 @@ def train(args, io):
 
         if args.use_sgd:
             # print("Use SGD")
-            opt = optim.SGD(model.parameters(), lr=args.lr*100,
+            opt = optim.SGD(model.parameters(), lr=args.lr * 0.1,
                             momentum=args.momentum, weight_decay=1e-4)
         else:
             # print("Use AdamW")
             opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-        # if args.scheduler == 'cos':
-        #     scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
-        # elif args.scheduler == 'step':
-        #     scheduler = StepLR(opt, step_size=20, gamma=0.5)
-        # else:
         scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
 
     criterion = cross_entropy
-
+    if local_rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        print("Number of parameters:", total_params)
     best_test_iou = 0
     # Mixed precision combines Floating Point (FP) 16 and FP 32 in different steps of the training.
     # FP16 training is also known as half-precision training, which comes with inferior performance.
@@ -246,7 +243,7 @@ def train(args, io):
                 data.cuda(local_rank, non_blocking=True), \
                 label_one_hot.cuda(local_rank, non_blocking=True), \
                 seg.cuda(local_rank, non_blocking=True)
-            data = data.permute(0, 2, 1)
+            data = data.transpose(2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()
             # forward
@@ -314,8 +311,9 @@ def train(args, io):
             for idx in range(label.shape[0]):
                 label_one_hot[idx, label[idx]] = 1
             label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
-            data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
-            data = data.permute(0, 2, 1)
+            data, label_one_hot, seg = data.to(device), label_one_hot.to(
+                device), seg.to(device)
+            data = data.transpose(2, 1)
             batch_size = data.size()[0]
             with torch.no_grad():
                 seg_pred = model(data, label_one_hot)
@@ -348,10 +346,6 @@ def train(args, io):
                                                                                                   test_acc,
                                                                                                   avg_per_class_acc,
                                                                                                   np.mean(test_ious))
-            # outstr = 'Test %d, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
-            #                                                                         test_acc,
-            #                                                                         avg_per_class_acc,
-            #                                                                         np.mean(test_ious))
             io.cprint(outstr)
         if np.mean(test_ious) >= best_test_iou:
             best_test_iou = np.mean(test_ious)
@@ -531,7 +525,7 @@ if __name__ == "__main__":
                         help='use a custom attention mechanism for fusion')
     parser.add_argument('--ff_dims', type=int, default=512,
                         help='dimension of feed forward network inside transformer')
-    parser.add_argument('--emb_dim', type=int, default=512, metavar='N',
+    parser.add_argument('--emb_dims', type=int, default=512, metavar='N',
                         help='Dimension of embeddings')
     parser.add_argument('--n_heads', type=int, default=4,
                         help='number of attention heads')

@@ -24,14 +24,14 @@ class EncoderDecoder(nn.Module):
         self.decoder = decoder
 
 
-    def forward(self, src, tgt, pointcloud):
+    def forward(self, src, tgt, pointcloud=None):
         "Take in and process masked src and target sequences."
         return self.decode(self.encode(src, pointcloud), tgt, pointcloud)
 
-    def encode(self, src, pointcloud):
+    def encode(self, src, pointcloud=None):
         return self.encoder(src, pointcloud)
 
-    def decode(self, memory, tgt, pointcloud):
+    def decode(self, memory, tgt, pointcloud=None):
         return self.decoder(tgt, memory, pointcloud)
 
 
@@ -43,7 +43,7 @@ class Encoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = nn.BatchNorm1d(layer.size)
 
-    def forward(self, x, pointcloud):
+    def forward(self, x, pointcloud=None):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
             x = layer(x, pointcloud)
@@ -60,7 +60,7 @@ class Decoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = nn.BatchNorm1d(layer.size)
 
-    def forward(self, x, memory, pointcloud):
+    def forward(self, x, memory, pointcloud=None):
         for layer in self.layers:
             x = layer(x, memory, pointcloud)
         x = self.norm(x.transpose(1, 2).contiguous()
@@ -83,29 +83,30 @@ class SublayerConnection(nn.Module):
         "Apply residual connection to any sublayer with the same size."
         x = self.norm(x.transpose(1, 2).contiguous()
                       ).transpose(1, 2).contiguous()
-        return x + self.dropout(sublayer(x))
+        return x + self.dropout(sublayer(x)[0])
 
 
 class EncoderLayer(nn.Module):
     "Encoder is made up of self-attn and feed forward (defined below)"
 
-    def __init__(self, size, self_attn, feed_forward, dropout):
+    def __init__(self, size, self_attn, feed_forward, dropout=0.1):
         super(EncoderLayer, self).__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 2)
         self.size = size
 
-    def forward(self, x, pointcloud):
+    def forward(self, x, pointcloud=None):
         "Follow Figure 1 (left) for connections."
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, pointcloud))
+        x = self.sublayer[0](x, lambda x: self.self_attn(
+            query=x, key=x, value=x, need_weights=False))
         return self.sublayer[1](x, self.feed_forward)
 
 
 class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
 
-    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout=0.1):
         super(DecoderLayer, self).__init__()
         self.size = size
         self.self_attn = self_attn
@@ -113,11 +114,13 @@ class DecoderLayer(nn.Module):
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 3)
 
-    def forward(self, x, memory, pointcloud):
+    def forward(self, x, memory, pointcloud=None):
         "Follow Figure 1 (right) for connections."
         m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, pointcloud))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, pointcloud))
+        x = self.sublayer[0](x, lambda x: self.self_attn(
+            query=x, key=x, value=x, need_weights=False))
+        x = self.sublayer[1](x, lambda x: self.src_attn(
+            query=x, key=m, value=m, need_weights=False))
         return self.sublayer[2](x, self.feed_forward)
 
 
@@ -133,7 +136,7 @@ class PositionwiseFeedForward(nn.Module):
 
     def forward(self, x):
         return self.w_2(self.dropout(self.norm(F.leaky_relu(self.w_1(x),
-         0.1).transpose(2,
+         0.2).transpose(2,
           1).contiguous())).transpose(2,
            1).contiguous())
 
@@ -141,7 +144,7 @@ class PositionwiseFeedForward(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, args):
         super(Transformer, self).__init__()
-        self.emb_dims = args.emb_dim
+        self.emb_dims = args.emb_dims
         self.N = args.n_blocks
         self.dropout = args.dropout
         self.ff_dims = args.ff_dims

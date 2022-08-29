@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def knn(x, k):
@@ -48,7 +47,7 @@ class DGCNN(nn.Module):
     def __init__(self, args):
         super(DGCNN, self).__init__()
 
-        self.emb_dims = args.emb_dim
+        self.emb_dims = args.emb_dims
         self.k = args.k
 
         self.conv1 = nn.Sequential(
