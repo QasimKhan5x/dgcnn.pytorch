@@ -100,3 +100,27 @@ class DGCNN(nn.Module):
 
         x = self.conv5(x).view(batch_size, -1, num_points)
         return x
+
+
+class EdgeConv(nn.Module):
+    def __init__(self, c_in, c_out, k) -> None:
+        super().__init__()
+
+        self.k = k
+        self.conv = nn.Sequential(
+            nn.Conv2d(c_in, c_out, 1, bias=False),
+            nn.BatchNorm2d(c_out),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        )
+
+    def forward(self, x):
+        # x (B x c_in x N)
+
+        # B x c_in x N x k
+        x = get_graph_feature(x, self.k)
+        # B x c_out x N x k
+        x = self.conv(x)
+        # B x c_out x N
+        x_max = x.max(dim=-1, keepdim=False)[0]
+        
+        return x, x_max
