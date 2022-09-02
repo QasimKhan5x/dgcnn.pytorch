@@ -3,7 +3,7 @@ import copy
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.attention import VectorAttention
+from models.attention import MultiHeadVectorAttention, VectorAttention
 
 # Part of the code is referred from: http://nlp.seas.harvard.edu/annotated-transformer/
 
@@ -151,7 +151,7 @@ class Transformer(nn.Module):
         self.n_heads = args.n_heads
 
         c = copy.deepcopy
-        attn = VectorAttention(args)
+        attn = MultiHeadVectorAttention(args)
         ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
 
         self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),

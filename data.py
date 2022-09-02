@@ -276,6 +276,12 @@ def rotate_pointcloud(pointcloud):
     return pointcloud
 
 
+def scale_pointcloud(pointcloud):
+    s = torch.distributions.uniform.Uniform(0.9, 1.1).sample([3])
+    s = torch.diag(s)
+    return torch.matmul(pointcloud, s)
+
+
 class ModelNet40(Dataset):
     def __init__(self, num_points, partition='train'):
         self.data, self.label = load_data_cls(partition)
@@ -337,7 +343,7 @@ class ShapeNetPart(Dataset):
 
 
 class ShapeNetPart_Augmented(Dataset):
-    def __init__(self, partition) -> None:
+    def __init__(self, partition, append_height=False) -> None:
         super(Dataset).__init__()
 
         assert partition in ("train", "trainval", "test")
@@ -346,6 +352,14 @@ class ShapeNetPart_Augmented(Dataset):
 
         self.partition = partition
         self.data = torch.load(f"data/shapenetpart_{partition}_dataset.pt")
+        
+        if append_height:
+            pcs = self.data[:][0]
+            heights = pcs - torch.min(pcs, dim=1, keepdim=True)[0]
+            heights /= torch.max(heights, dim=1, keepdim=True)[0] + 1e-9
+            new_pcs = torch.cat((pcs, heights), dim=-1)
+            old_data = self.data.tensors[1:]
+            self.data.tensors = (new_pcs, *old_data)
 
     def __len__(self):
         return len(self.data)
@@ -355,12 +369,14 @@ class ShapeNetPart_Augmented(Dataset):
         if self.partition == "train":
             functions = [translate_pointcloud,
                          jitter_pointcloud, 
-                         rotate_pointcloud]
+                         rotate_pointcloud,
+                         scale_pointcloud
+                         ]
             random.shuffle(functions)
-            choices = torch.randint(low=0, high=2, size=(3,))
+            choices = torch.randint(2, (len(functions),))
             for func, choice in zip(functions, choices):
                 if choice.item():
-                    pointcloud = func(pointcloud)
+                    pointcloud[:, :3] = func(pointcloud[:, :3])
         return pointcloud, label, seg
 
 

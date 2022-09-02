@@ -13,6 +13,7 @@ from __future__ import print_function
 import argparse
 import gc
 import os
+import sys
 
 import numpy as np
 import torch
@@ -22,9 +23,10 @@ import torch.optim as optim
 from plyfile import PlyData, PlyElement
 from sklearn import metrics
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import OneCycleLR  # type: ignore
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 from data import ShapeNetPart_Augmented
 from loss import cross_entropy
@@ -157,8 +159,10 @@ def prepare_dl(dataset, drop_last, batch_size, pin_memory, num_workers=0):
 
 
 def train(args, io):
-    train_ds = ShapeNetPart_Augmented(partition="trainval")
-    test_ds = ShapeNetPart_Augmented(partition="test")
+    train_ds = ShapeNetPart_Augmented(
+        partition="trainval", append_height=args.use_height)
+    test_ds = ShapeNetPart_Augmented(
+        partition="test", append_height=args.use_height)
     
     drop_last = len(train_ds) >= 100
     ngpus_per_node = torch.cuda.device_count()
@@ -197,14 +201,17 @@ def train(args, io):
         # print("Let's use", torch.cuda.device_count(), "GPUs!")
 
         if args.use_sgd:
-            # print("Use SGD")
-            opt = optim.SGD(model.parameters(), lr=args.lr * 0.1,
-                            momentum=args.momentum, weight_decay=1e-4)
+            opt = optim.SGD(model.parameters(), lr=args.lr,
+                            momentum=args.momentum, weight_decay=args.decay)
         else:
-            # print("Use AdamW")
-            opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+            opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.decay)
 
-        scheduler = OneCycleLR(opt, max_lr=args.lr*100, epochs=200, steps_per_epoch=len(train_loader))
+        if args.scheduler == 'cycle':
+            scheduler = OneCycleLR(opt, max_lr=0.1, epochs=200, 
+                                   steps_per_epoch=len(train_loader))
+        else:
+            # cosine scheduler
+            scheduler = CosineAnnealingLR(opt, len(train_loader))
 
     criterion = cross_entropy
     if local_rank == 0:
@@ -230,10 +237,8 @@ def train(args, io):
         train_true_seg = []
         train_pred_seg = []
         train_label_seg = []
-
         # batch accumulation parameter
-        accum_iter = 4
-        for batch_idx, (data, label, seg) in enumerate(train_loader):
+        for data, label, seg in tqdm(train_loader):
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
             for idx in range(label.shape[0]):
@@ -250,15 +255,16 @@ def train(args, io):
             with torch.cuda.amp.autocast():  # type: ignore
                 seg_pred = model(data.contiguous(), label_one_hot.contiguous())
                 seg_pred = seg_pred.permute(0, 2, 1).contiguous()
+                if torch.isnan(seg_pred).sum() > 0:
+                    print("NaNs detected!!! Stopping training")
+                    torch.save(seg_pred, f"preds_{local_rank}.pt")
+                    torch.save(model.module.state_dict(), f"weights_{local_rank}.pt")
+                    sys.exit(0)
                 loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
-                # normalize loss to account for batch accumulation
-                # loss /= accum_iter
                 ddp_train_loss[0] += loss.item()
             fp16_scaler.scale(loss).backward()  # type: ignore
-            # if ((batch_idx + 1) % accum_iter == 0) or (batch_idx + 1 == len(train_loader)):
             fp16_scaler.step(opt)
-            if args.scheduler == 'cycle':
-                scheduler.step()
+            scheduler.step()
             fp16_scaler.update()
             pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
             ddp_train_loss[1] += batch_size
@@ -269,14 +275,6 @@ def train(args, io):
             train_true_seg.append(seg_np)
             train_pred_seg.append(pred_np)
             train_label_seg.append(label.reshape(-1))
-        if args.scheduler == 'cos':
-            scheduler.step()
-        elif args.scheduler == 'step':
-            if opt.param_groups[0]['lr'] > 1e-5:
-                scheduler.step()
-            if opt.param_groups[0]['lr'] < 1e-5:
-                for param_group in opt.param_groups:
-                    param_group['lr'] = 1e-5
         train_true_cls = np.concatenate(train_true_cls)
         train_pred_cls = np.concatenate(train_pred_cls)
         train_acc = metrics.accuracy_score(train_true_cls, train_pred_cls)
@@ -347,16 +345,20 @@ def train(args, io):
                                                                                                   avg_per_class_acc,
                                                                                                   np.mean(test_ious))
             io.cprint(outstr)
-        if np.mean(test_ious) >= best_test_iou:
-            best_test_iou = np.mean(test_ious)
-            save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
-                            ddp_test_loss[1], args.exp_name, best=True)
+            if np.mean(test_ious) >= best_test_iou:
+                best_test_iou = np.mean(test_ious)
+                save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
+                                ddp_test_loss[1], args.exp_name, best=True)
         gc.collect()
         torch.cuda.empty_cache()
 
 
 def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
     if best:
+        save_dir = f'outputs/{exp_name}/models/'
+        files = os.listdir(save_dir)
+        for file in files:
+            os.remove(os.path.join(save_dir, file))
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.module.state_dict(),
@@ -365,6 +367,10 @@ def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
             'loss': loss,
         }, f'outputs/{exp_name}/models/transformer_{epoch}.checkpoint')
     else:
+        save_dir = f'outputs/{exp_name}/checkpoints/'
+        files = os.listdir(save_dir)
+        for file in files:
+            os.remove(os.path.join(save_dir, file))
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.module.state_dict(),
@@ -458,13 +464,12 @@ def main(args):
     args.world_size = int(os.environ["WORLD_SIZE"])
     args.local_rank = int(os.environ["LOCAL_RANK"])
     args.rank = int(os.environ['RANK'])
-    # ngpus_per_node = torch.cuda.device_count()
-    # args.world_size = ngpus_per_node * args.world_size
 
     if args.local_rank == 0:
         io.cprint(str(args))
 
     torch.cuda.set_device(args.local_rank)  # before your code runs
+    torch.backends.cudnn.benchmark = True  # type: ignore
     torch.manual_seed(args.seed)
     io.cprint(
         'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
@@ -509,27 +514,31 @@ if __name__ == "__main__":
     parser.add_argument('--test_batch_size', type=int, default=16, metavar='batch_size',
                         help='Size of batch)')
     parser.add_argument('--epochs', type=int, default=200, metavar='N',
-                        help='number of episode to train ')
-    parser.add_argument('--use_sgd', type=bool, default=True,
+                        help='number of episode to train')
+    parser.add_argument('--use_sgd', default=False, action='store_true',
                         help='Use SGD')
-    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
-                        help='learning rate (default: 0.001, 0.1 if using sgd)')
+    parser.add_argument('--decay', type=float, default=1e-4,
+                        help='Weight decay for optimizer')
+    parser.add_argument('--lr', type=float, default=2e-3, metavar='LR',
+                        help='learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
     parser.add_argument('--scheduler', type=str, default='cycle', metavar='N',
-                        choices=['cos', 'step'],
-                        help='Scheduler to use, [cos, step]')
-    parser.add_argument('--no_cuda', type=bool, default=False,
-                        help='enables CUDA training')
-    parser.add_argument('--use_custom_attention', action='store_true',
+                        choices=['cos', 'cycle'],
+                        help='Scheduler to use, [cos, cycle]')
+    parser.add_argument('--no_cuda', default=False, action='store_true',
+                        help='disables CUDA training')
+    parser.add_argument('--use_custom_attention', default=False, action='store_true',
                         help='use a custom attention mechanism for fusion')
+    parser.add_argument('--use_height', default=False, action='store_true',
+                        help='append relative height of each point as an extra feature')
     parser.add_argument('--ff_dims', type=int, default=512,
                         help='dimension of feed forward network inside transformer')
     parser.add_argument('--emb_dims', type=int, default=512, metavar='N',
                         help='Dimension of embeddings')
-    parser.add_argument('--n_heads', type=int, default=4,
+    parser.add_argument('--n_heads', type=int, default=2,
                         help='number of attention heads')
-    parser.add_argument('--n_blocks', type=int, default=1,
+    parser.add_argument('--n_blocks', type=int, default=2,
                         help='number of layers of encoder/decoder')
     parser.add_argument('--d_qkv', type=int, default=64,
                         help='dimension of q,k,v')
@@ -550,6 +559,10 @@ if __name__ == "__main__":
     parser.add_argument('--visu_format', type=str, default='ply',
                         help='file format of visualization')
     args = parser.parse_args()
+
+    import pickle
+    with open("args.pkl", "wb") as f:
+        pickle.dump(args, f)
     
     _init_()
 

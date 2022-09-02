@@ -19,7 +19,7 @@ def compute_hog_1x1(x, k, use_cpu=False):
     '''
     batch_size = x.size(0)
     num_pts = x.size(2)
-
+    dev = x.get_device()
     nn_idx = knn(x, k).view(-1)
     # B x N x k x 3
     x_nn = x.contiguous().view(batch_size * num_pts, -
@@ -40,8 +40,8 @@ def compute_hog_1x1(x, k, use_cpu=False):
         v = v.cuda(int(os.environ["LOCAL_RANK"]))
         s = s.cuda(int(os.environ["LOCAL_RANK"]))
     elif not use_cpu:
-        v = v.cuda()
-        s = s.cuda()
+        v = v.cuda(dev)
+        s = s.cuda(dev)
     # get the first element (largest variance)
     gradients = v[:, :, 0]  # BxNx3x3 -> BxNx3
     magnitudes = s[:, :, 0].unsqueeze(-1)  # BxNx3 -> BxNx1
@@ -67,8 +67,9 @@ def compute_hog_1x1(x, k, use_cpu=False):
             histogram = torch.zeros((batch_size, num_pts, 9, 2), device=torch.device(
                 int(os.environ['LOCAL_RANK'])))
         else:
+            dev = x.get_device()
             histogram = torch.zeros(
-                (batch_size, num_pts, 9, 2), device=torch.device('cuda'))
+                (batch_size, num_pts, 9, 2), device=torch.device(dev))
     # 20 degrees bins computed from angles
     bins = torch.floor(cells[:, :, :, :2] / 20.0 - 0.5) % 9
     # vote for bin i
@@ -104,6 +105,7 @@ class HOG_Embedding(nn.Module):
     def forward(self, x):
         # x (B x 3 x N)
         # (B x 9 x N)
-        x = compute_hog_1x1(x, k=self.k)
+        hog = compute_hog_1x1(x[:, :3], k=self.k)
+        x = torch.cat((hog, x[:, 3:]), dim=1)
         # B x c_out, N
         return self.network(x)

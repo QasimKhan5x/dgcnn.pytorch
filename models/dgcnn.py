@@ -11,7 +11,7 @@ def knn(x, k):
     return idx
 
 
-def get_graph_feature(x, k=20, knn_only=False, disp_only=False):
+def get_graph_feature(x, k, knn_only=False, disp_only=False):
     # x = x.squeeze()
     idx = knn(x, k=k)  # (batch_size, num_points, k)
     batch_size, num_points, _ = idx.size()
@@ -43,75 +43,26 @@ def get_graph_feature(x, k=20, knn_only=False, disp_only=False):
     return feature
 
 
-class DGCNN(nn.Module):
-    def __init__(self, args):
-        super(DGCNN, self).__init__()
-
-        self.emb_dims = args.emb_dims
-        self.k = args.k
-
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3 * 2, 64, kernel_size=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(64 * 2, 128, kernel_size=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        )
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(128 * 2, 256, kernel_size=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        )
-        self.conv5 = nn.Sequential(
-            nn.Conv2d(512, self.emb_dims, kernel_size=1, bias=False),
-            nn.BatchNorm2d(self.emb_dims),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        )
-
-    def forward(self, x):
-        batch_size, num_dims, num_points = x.size()
-
-        # B C N K
-        x = get_graph_feature(x, k=self.k)
-        x = self.conv1(x)
-        x1 = x.max(dim=-1, keepdim=False)[0]
-
-        x = get_graph_feature(x1, k=self.k)
-        x = self.conv2(x)
-        x2 = x.max(dim=-1, keepdim=False)[0]
-
-        x = get_graph_feature(x2, k=self.k)
-        x = self.conv3(x)
-        x3 = x.max(dim=-1, keepdim=False)[0]
-
-        x = get_graph_feature(x3, k=self.k)
-        x = self.conv4(x)
-        x4 = x.max(dim=-1, keepdim=False)[0]
-
-        x = torch.cat((x1, x2, x3, x4), dim=1).unsqueeze(-1)
-
-        x = self.conv5(x).view(batch_size, -1, num_points)
-        return x
-
-
 class EdgeConv(nn.Module):
-    def __init__(self, c_in, c_out, k) -> None:
+    def __init__(self, c_in, c_out, k, double_conv=False) -> None:
         super().__init__()
 
         self.k = k
-        self.conv = nn.Sequential(
-            nn.Conv2d(c_in, c_out, 1, bias=False),
-            nn.BatchNorm2d(c_out),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        )
+        if double_conv:
+            self.conv = nn.Sequential(
+                nn.Conv2d(c_in * 2, c_out, 1, bias=False),
+                nn.BatchNorm2d(c_out),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(c_out, c_out, 1, bias=False),
+                nn.BatchNorm2d(c_out),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            )
+        else:
+            self.conv = nn.Sequential(
+                nn.Conv2d(c_in * 2, c_out, 1, bias=False),
+                nn.BatchNorm2d(c_out),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            )
 
     def forward(self, x):
         # x (B x c_in x N)
@@ -120,7 +71,120 @@ class EdgeConv(nn.Module):
         x = get_graph_feature(x, self.k)
         # B x c_out x N x k
         x = self.conv(x)
-        # B x c_out x N
+        # B x c_out x N x 1
         x_max = x.max(dim=-1, keepdim=False)[0]
-        
-        return x, x_max
+
+        return x_max
+
+
+class InvResMLP(nn.Module):
+    '''https://arxiv.org/abs/2206.04670'''
+    def __init__(self, c_in, c_out, k) -> None:
+        super().__init__()
+
+        # edge conv + high res mlp
+        self.ec = nn.Sequential(
+            EdgeConv(c_in, c_out, k=k, double_conv=True),
+            nn.Conv1d(c_out, 1024, 1, bias=False),
+            nn.BatchNorm1d(1024),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.revert = nn.Sequential(
+            nn.Conv1d(1024, c_out, 1, bias=False),
+            nn.BatchNorm1d(c_out)
+        )
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+        self.reshape = nn.Conv1d(c_in, c_out, 1, bias=False)
+
+    def forward(self, x):
+        y = self.ec(x)
+        y = self.revert(y)
+
+        return self.act(y + self.reshape(x))
+
+
+class DGCNN(nn.Module):
+    def __init__(self, args, c_in):
+        super(DGCNN, self).__init__()
+
+        emb_dims = args.emb_dims
+        self.k = args.k
+
+        self.conv1 = EdgeConv(c_in, emb_dims // 8, k=self.k, double_conv=True)
+        self.conv2 = EdgeConv(emb_dims // 8 + 3, emb_dims //
+                              8, k=self.k, double_conv=True)
+        self.conv3 = EdgeConv(emb_dims // 8 + 3, emb_dims //
+                              4, k=self.k, double_conv=True)
+        self.conv4 = EdgeConv(emb_dims // 4 + 3, emb_dims //
+                              2, k=self.k, double_conv=True)
+
+        self.resize1 = nn.Conv1d(c_in, emb_dims // 8, 1, bias=False)
+        self.resize2 = nn.Conv1d(emb_dims // 8, emb_dims // 4, 1, bias=False)
+        self.resize3 = nn.Conv1d(emb_dims // 4, emb_dims // 2, 1, bias=False)
+
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(emb_dims + 3, emb_dims, kernel_size=1, bias=False),
+            nn.BatchNorm1d(emb_dims),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        )
+
+    def forward(self, x):
+        num_points = x.size(2)
+
+        # B C N 
+        x1 = self.conv1(x) + self.resize1(x)
+        # add original points (C += 3)
+        x1 = torch.cat((x[:, :3], x1), dim=1)
+        # B x (64) x N (add features except first 3 dims bcz they are coordinates)
+        x2 = self.conv2(x1) + x1[:, 3:]
+        x2 = torch.cat((x[:, :3], x2), dim=1)
+        x3 = self.conv3(x2) + self.resize2(x2[:, 3:])
+        x3 = torch.cat((x[:, :3], x3), dim=1)
+        x4 = self.conv4(x3) + self.resize3(x3[:, 3:])
+        # B x C + 3 x N (x1 already has the required dims so no need to repeat it)
+        point_ftrs = torch.cat((x1, x2[:, 3:], x3[:, 3:], x4), dim=1)
+        # mlp on point features B x C x N
+        x = self.conv5(point_ftrs)
+        # global features (B x emb_dims x num_points)
+        global_ftrs = x.max(dim=-1, keepdim=True)[0].repeat(1, 1, num_points)
+        return point_ftrs, global_ftrs
+
+
+class DGCNN_PNeXt(nn.Module):
+    def __init__(self, args, c_in):
+        super(DGCNN_PNeXt, self).__init__()
+
+        emb_dims = args.emb_dims
+        self.k = args.k
+
+        self.conv1 = InvResMLP(c_in, emb_dims // 8, k=self.k)
+        self.conv2 = InvResMLP(emb_dims // 8 + 3, emb_dims // 8, k=self.k)
+        self.conv3 = InvResMLP(emb_dims // 8 + 3, emb_dims // 4, k=self.k)
+        self.conv4 = InvResMLP(emb_dims // 4 + 3, emb_dims // 2, k=self.k)
+
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(emb_dims + 3, emb_dims, kernel_size=1, bias=False),
+            nn.BatchNorm1d(emb_dims),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        )
+
+    def forward(self, x):
+        num_points = x.size(2)
+
+        # B C N
+        x1 = self.conv1(x)
+        # add original points (C += 3)
+        x1 = torch.cat((x[:, :3], x1), dim=1)
+        # B x (64) x N (add features except first 3 dims bcz they are coordinates)
+        x2 = self.conv2(x1) + x1[:, 3:]
+        x2 = torch.cat((x[:, :3], x2), dim=1)
+        x3 = self.conv3(x2)
+        x3 = torch.cat((x[:, :3], x3), dim=1)
+        x4 = self.conv4(x3) # don't add to x4 because no more convolutions applied
+        # B x C + 3 x N (x1 already has the required dims so no need to repeat it)
+        point_ftrs = torch.cat((x1, x2[:, 3:], x3[:, 3:], x4), dim=1)
+        # mlp on point features B x C x N
+        x = self.conv5(point_ftrs)
+        # global features (B x emb_dims x num_points)
+        global_ftrs = x.max(dim=-1, keepdim=True)[0].repeat(1, 1, num_points)
+        return point_ftrs, global_ftrs
