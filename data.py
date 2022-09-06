@@ -14,18 +14,16 @@ Modified by
 
 import glob
 import json
-import math
 import os
-import random
 import sys
-
-random.seed(42)
 
 import cv2
 import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from transforms import apply_transforms, center_and_normalize
 
 
 def download_modelnet40():
@@ -255,33 +253,6 @@ def load_color_semseg():
             break  
     
 
-def translate_pointcloud(pointcloud):
-    xyz1 = torch.distributions.uniform.Uniform(2/3, 3/2).sample([3])
-    xyz2 = torch.distributions.uniform.Uniform(-0.2, 0.2).sample([3])       
-    translated_pointcloud = torch.add(torch.multiply(pointcloud, xyz1), xyz2)
-    return translated_pointcloud
-
-
-def jitter_pointcloud(pointcloud, sigma=0.01, clip=0.02):
-    N, C = pointcloud.shape
-    pointcloud += torch.clamp(sigma * torch.randn(N, C), -1 * clip, clip)
-    return pointcloud
-
-
-def rotate_pointcloud(pointcloud):
-    theta = math.pi * 2 * torch.randn(size=(1,))
-    rotation_matrix = torch.tensor(
-        [[torch.cos(theta), -torch.sin(theta)], [torch.sin(theta), torch.cos(theta)]])
-    pointcloud[:, [0, 2]] = torch.matmul(pointcloud[:, [0, 2]], rotation_matrix)  # random rotation (x,z)
-    return pointcloud
-
-
-def scale_pointcloud(pointcloud):
-    s = torch.distributions.uniform.Uniform(0.9, 1.1).sample([3])
-    s = torch.diag(s)
-    return torch.matmul(pointcloud, s)
-
-
 class ModelNet40(Dataset):
     def __init__(self, num_points, partition='train'):
         self.data, self.label = load_data_cls(partition)
@@ -367,21 +338,12 @@ class ShapeNetPart_Augmented(Dataset):
     def __getitem__(self, index):
         pointcloud, label, seg = self.data[index]
         if self.partition == "train":
-            functions = [translate_pointcloud,
-                         jitter_pointcloud, 
-                         rotate_pointcloud,
-                         scale_pointcloud
-                         ]
-            random.shuffle(functions)
-            choices = torch.randint(2, (len(functions),))
-            for func, choice in zip(functions, choices):
-                if choice.item():
-                    pointcloud[:, :3] = func(pointcloud[:, :3])
+            pointcloud = apply_transforms(pointcloud, norm_xyz=False, rgb=False)
         return pointcloud, label, seg
 
 
 class S3DIS(Dataset):
-    def __init__(self, num_points=4096, partition='train', test_area='1'):
+    def __init__(self, num_points=4096, partition='train', test_area='5'):
         self.data, self.seg = load_data_semseg(partition, test_area)
         self.num_points = num_points
         self.partition = partition    
@@ -400,6 +362,8 @@ class S3DIS(Dataset):
 
     def __len__(self):
         return self.data.shape[0]
+
+        
 
 
 if __name__ == '__main__':

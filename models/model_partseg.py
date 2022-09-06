@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from models.dgcnn import DGCNN_PNeXt
+from models.hog import compute_hog_1x1
 from models.layers import ResidualConvLayer
 
 
@@ -59,8 +60,11 @@ class Net(nn.Module):
     def __init__(self, args):
         super(Net, self).__init__()
 
+        self.k = args.k
+        # height
         extra_channels = 3 if args.use_height else 0
-
+        # histogram
+        extra_channels += 18
         # dgcnn graph features
         self.emb_nn = DGCNN_PNeXt(args, c_in=3+extra_channels)
         # positional embeddings
@@ -75,6 +79,10 @@ class Net(nn.Module):
         '''
         src = input[0]
         lbl = input[1]
+        hog = compute_hog_1x1(src[:, :3], k=self.k)
+        src = torch.cat((src, hog), dim=1)
+        # src[:, :3] = src[:, :3] - src[:, :3].mean(dim=-1, keepdim=True)
+        # src[:, :3] = F.normalize(src[:, :3], p=2.0, dim=-1)
         # (batch_size, emb_dims, num_points) (check result with and without pos_mlp)
         # canonical = self.pos_mlp(src)
         graph_point_ftrs, graph_global_ftrs = self.emb_nn(src)

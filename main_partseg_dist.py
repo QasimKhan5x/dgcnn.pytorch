@@ -13,6 +13,7 @@ from __future__ import print_function
 import argparse
 import gc
 import os
+import random
 import sys
 
 import numpy as np
@@ -23,7 +24,8 @@ import torch.optim as optim
 from plyfile import PlyData, PlyElement
 from sklearn import metrics
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR  # type: ignore
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
@@ -42,24 +44,22 @@ seg_num = [4, 2, 2, 4, 4, 3, 3, 2, 4, 2, 6, 2, 3, 3, 3, 3]
 index_start = [0, 4, 6, 8, 12, 16, 19, 22, 24, 28, 30, 36, 38, 41, 44, 47]
 
 
-def _init_():
-    if not os.path.exists('outputs'):
-        os.makedirs('outputs')
-    if not os.path.exists('outputs/'+args.exp_name):
-        os.makedirs('outputs/'+args.exp_name)
-    if not os.path.exists('outputs/'+args.exp_name+'/'+'models'):
-        os.makedirs('outputs/'+args.exp_name+'/'+'models')
-    if not os.path.exists('outputs/'+args.exp_name+'/'+'visualization'):
-        os.makedirs('outputs/'+args.exp_name+'/'+'visualization')
-    if not os.path.exists('outputs/'+args.exp_name+'/'+'checkpoints'):
-        os.makedirs('outputs/'+args.exp_name+'/'+'checkpoints')
-    if not os.path.exists('outputs/'+args.exp_name+'/'+'backups'):
-        os.makedirs('outputs/'+args.exp_name+'/'+'backups')
-    os.system('cp main_partseg.py outputs'+'/'+args.exp_name+'/'+'main_partseg.py.backup')
-    os.system('cp loss.py outputs'+'/' +
-              args.exp_name+'/'+'loss.py.backup')
-    os.system('cp models/* outputs'+'/' +
-              args.exp_name+'/'+'backups/')
+def _init_(exp_name):
+    BASE_DIR = f'outputs/partseg/{exp_name}'
+    if not os.path.exists(BASE_DIR):
+        os.makedirs(BASE_DIR)
+    if not os.path.exists(f'{BASE_DIR}/models'):
+        os.makedirs(f'{BASE_DIR}/models')
+    if not os.path.exists(f'{BASE_DIR}/visualization'):
+        os.makedirs(f'{BASE_DIR}/visualization')
+    if not os.path.exists(f'{BASE_DIR}/checkpoints'):
+        os.makedirs(f'{BASE_DIR}/checkpoints')
+    if not os.path.exists(f'{BASE_DIR}/backups'):
+        os.makedirs(f'{BASE_DIR}/backups')
+    os.system(f'cp main_partseg.py {BASE_DIR}/backups/main_partseg.py.backup')
+    os.system(f'cp loss.py {BASE_DIR}/backups/loss.py.backup')
+    os.system(f'cp data.py {BASE_DIR}/backups/data.py.backup')
+    os.system(f'cp models/* {BASE_DIR}/backups/')
 
 
 def calculate_shape_IoU(pred_np, seg_np, label, class_choice, visual=False):
@@ -86,7 +86,7 @@ def calculate_shape_IoU(pred_np, seg_np, label, class_choice, visual=False):
     return shape_ious
 
 
-def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, class_choice):
+def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, class_choice, exp_name):
     global class_indexs
     global visual_warning
     visu = visu.split('_')
@@ -113,8 +113,8 @@ def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, cla
         if skip:
             class_indexs[int(label[i])] = class_indexs[int(label[i])] + 1
         else:  
-            if not os.path.exists('outputs/'+args.exp_name+'/'+'visualization'+'/'+classname):
-                os.makedirs('outputs/'+args.exp_name+'/'+'visualization'+'/'+classname)
+            if not os.path.exists('outputs/partseg/'+exp_name+'/'+'visualization'+'/'+classname):
+                os.makedirs('outputs/partseg/'+exp_name+'/'+'visualization'+'/'+classname)
             for j in range(0, data.shape[2]):
                 RGB.append(partseg_colors[int(pred[i][j])])
                 RGB_gt.append(partseg_colors[int(seg[i][j])])
@@ -127,8 +127,8 @@ def visualization(visu, visu_format, data, pred, seg, label, partseg_colors, cla
             xyzRGB_gt = np.concatenate((xyz_np.transpose(1, 0), np.array(RGB_gt)), axis=1)
             IoU = calculate_shape_IoU(np.array(pred_np), np.array(seg_np), label[i].cpu().numpy(), class_choice, visual=True)
             IoU = str(round(IoU[0], 4))
-            filepath = 'outputs/'+args.exp_name+'/'+'visualization'+'/'+classname+'/'+classname+'_'+str(class_index)+'_pred_'+IoU+'.'+visu_format
-            filepath_gt = 'outputs/'+args.exp_name+'/'+'visualization'+'/'+classname+'/'+classname+'_'+str(class_index)+'_gt.'+visu_format
+            filepath = 'outputs/partseg/'+exp_name+'/'+'visualization'+'/'+classname+'/'+classname+'_'+str(class_index)+'_pred_'+IoU+'.'+visu_format
+            filepath_gt = 'outputs/partseg/'+exp_name+'/'+'visualization'+'/'+classname+'/'+classname+'_'+str(class_index)+'_gt.'+visu_format
             if visu_format=='txt':
                 np.savetxt(filepath, xyzRGB, fmt='%s', delimiter=' ') 
                 np.savetxt(filepath_gt, xyzRGB_gt, fmt='%s', delimiter=' ') 
@@ -158,6 +158,51 @@ def prepare_dl(dataset, drop_last, batch_size, pin_memory, num_workers=0):
     return dataloader
 
 
+def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
+    if best:
+        save_dir = f'outputs/partseg/{exp_name}/models/'
+        files = os.listdir(save_dir)
+        for file in files:
+            os.remove(os.path.join(save_dir, file))
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.module.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': loss,
+        }, f'outputs/partseg/{exp_name}/models/transformer_{epoch}.checkpoint')
+    else:
+        save_dir = f'outputs/partseg/{exp_name}/checkpoints/'
+        files = os.listdir(save_dir)
+        for file in files:
+            os.remove(os.path.join(save_dir, file))
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.module.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': loss,
+        }, f'outputs/partseg/{exp_name}/checkpoints/ckpt_{epoch}.checkpoint')
+
+
+def load_checkpoint(path, args, train_dl_size):
+    checkpoint = torch.load(path)
+    model = Net(args).cuda()
+    opt = optim.SGD(model.parameters(), lr=args.lr*100,
+                    momentum=args.momentum, weight_decay=1e-4)
+    scheduler = OneCycleLR(opt, max_lr=args.lr*100,
+                           epochs=args.epochs, steps_per_epoch=train_dl_size)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    opt.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = DDP(model,
+                device_ids=[int(os.environ['LOCAL_RANK'])],
+                output_device=int(os.environ['LOCAL_RANK'])
+            )
+    return model, opt, scheduler
+
+
 def train(args, io):
     train_ds = ShapeNetPart_Augmented(
         partition="trainval", append_height=args.use_height)
@@ -178,17 +223,18 @@ def train(args, io):
     # Try to load models
     seg_num_all = 50
     seg_start_index = 0
-    if args.model == 'transformer':
-        model = Net(args).cuda()
-    else:
-        raise Exception("Not implemented")
+    model = Net(args).cuda()
     
-    if os.path.isfile(f'outputs/{args.exp_name}/checkpoints/ckpt.checkpoint'):
+    if os.path.isfile(f'outputs/partseg/{args.exp_name}/models/transformer_126.checkpoint'):
+        print("Reusing model checkpoint")
         model, opt, scheduler = load_checkpoint(
-            path=f'outputs/{args.exp_name}/ckpt.checkpoint',
+            path=f'outputs/partseg/{args.exp_name}/models/transformer_126.checkpoint',
             args=args,
             train_dl_size=len(train_loader))
+        dist.barrier()
+        start = 127
     else:
+        start = 0
         # Convert BatchNorm to SyncBatchNorm.
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)        
         # wrap the model with DDP
@@ -207,28 +253,29 @@ def train(args, io):
             opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.decay)
 
         if args.scheduler == 'cycle':
-            scheduler = OneCycleLR(opt, max_lr=0.1, epochs=200, 
+            scheduler = OneCycleLR(opt, max_lr=0.1, epochs=args.epochs, 
                                    steps_per_epoch=len(train_loader))
         else:
             # cosine scheduler
             scheduler = CosineAnnealingLR(opt, len(train_loader))
 
-    criterion = cross_entropy
     if local_rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
         print("Number of parameters:", total_params)
+    criterion = cross_entropy
     best_test_iou = 0
     # Mixed precision combines Floating Point (FP) 16 and FP 32 in different steps of the training.
     # FP16 training is also known as half-precision training, which comes with inferior performance.
     # Automatic mixed-precision is literally the best of both worlds:
     # reduced training time with comparable performance to FP32
     fp16_scaler = torch.cuda.amp.GradScaler(enabled=True)  # type: ignore
-    for epoch in range(args.epochs):
+    for epoch in range(start, args.epochs):
         ####################
         # Train
         ####################
         ddp_train_loss = torch.zeros(2).to(torch.device(local_rank))
-        # if we are using DistributedSampler, we have to tell it which epoch this is
+        # if we are using DistributedSampler, 
+        # we have to tell it which epoch this is
         train_loader.sampler.set_epoch(epoch)  # type: ignore
         test_loader.sampler.set_epoch(epoch)  # type: ignore
         model.train()
@@ -237,7 +284,6 @@ def train(args, io):
         train_true_seg = []
         train_pred_seg = []
         train_label_seg = []
-        # batch accumulation parameter
         for data, label, seg in tqdm(train_loader):
             seg = seg - seg_start_index
             label_one_hot = np.zeros((label.shape[0], 16))
@@ -258,15 +304,16 @@ def train(args, io):
                 if torch.isnan(seg_pred).sum() > 0:
                     print("NaNs detected!!! Stopping training")
                     torch.save(seg_pred, f"preds_{local_rank}.pt")
-                    torch.save(model.module.state_dict(), f"weights_{local_rank}.pt")
+                    torch.save(model.module.state_dict(),
+                               f"weights_{local_rank}.pt")
                     sys.exit(0)
-                loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())
-                ddp_train_loss[0] += loss.item()
+                loss = criterion(seg_pred.view(-1, seg_num_all), seg.view(-1,1).squeeze())   
             fp16_scaler.scale(loss).backward()  # type: ignore
             fp16_scaler.step(opt)
             scheduler.step()
             fp16_scaler.update()
             pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
+            ddp_train_loss[0] += loss.item() * batch_size
             ddp_train_loss[1] += batch_size
             seg_np = seg.cpu().numpy()                  # (batch_size, num_points)
             pred_np = pred.detach().cpu().numpy()       # (batch_size, num_points)
@@ -318,7 +365,7 @@ def train(args, io):
                 seg_pred = seg_pred.permute(0, 2, 1).contiguous()
                 loss = criterion(seg_pred.view(-1, seg_num_all),
                                 seg.view(-1, 1).squeeze())
-            ddp_test_loss[0] += loss.item()
+            ddp_test_loss[0] += loss.item() * batch_size
             ddp_test_loss[1] += batch_size
             pred = seg_pred.max(dim=2)[1]
             seg_np = seg.cpu().numpy()
@@ -353,48 +400,6 @@ def train(args, io):
         torch.cuda.empty_cache()
 
 
-def save_checkpoint(epoch, model, opt, scheduler, loss, exp_name, best=False):
-    if best:
-        save_dir = f'outputs/{exp_name}/models/'
-        files = os.listdir(save_dir)
-        for file in files:
-            os.remove(os.path.join(save_dir, file))
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.module.state_dict(),
-            'optimizer_state_dict': opt.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'loss': loss,
-        }, f'outputs/{exp_name}/models/transformer_{epoch}.checkpoint')
-    else:
-        save_dir = f'outputs/{exp_name}/checkpoints/'
-        files = os.listdir(save_dir)
-        for file in files:
-            os.remove(os.path.join(save_dir, file))
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.module.state_dict(),
-            'optimizer_state_dict': opt.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'loss': loss,
-        }, f'outputs/{exp_name}/checkpoints/ckpt_{epoch}.checkpoint')
-
-
-def load_checkpoint(path, args, train_dl_size):
-    checkpoint = torch.load(path)
-    model = Net(args)
-    opt = optim.SGD(model.parameters(), lr=args.lr*100,
-                    momentum=args.momentum, weight_decay=1e-4)
-    scheduler = OneCycleLR(opt, max_lr=args.lr*100,
-                           epochs=200, steps_per_epoch=train_dl_size)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    opt.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = DDP(model, device_ids=[int(os.environ["LOCAL_RANK"])])
-    return model, opt, scheduler
-
-
 def test(args, io):
     test_ds = ShapeNetPart_Augmented(partition="test")
     ngpus_per_node = torch.cuda.device_count()
@@ -427,7 +432,6 @@ def test(args, io):
         label_one_hot = torch.from_numpy(label_one_hot.astype(np.float32))
         data, label_one_hot, seg = data.to(device), label_one_hot.to(device), seg.to(device)
         data = data.permute(0, 2, 1)
-        batch_size = data.size()[0]
         with torch.no_grad():
             seg_pred = model(data, label_one_hot)
         seg_pred = seg_pred.permute(0, 2, 1).contiguous()
@@ -440,7 +444,7 @@ def test(args, io):
         test_pred_seg.append(pred_np)
         test_label_seg.append(label.reshape(-1))
         # visiualization
-        visualization(args.visu, args.visu_format, data, pred, seg, label, partseg_colors, args.class_choice) 
+        visualization(args.visu, args.visu_format, data, pred, seg, label, partseg_colors, args.class_choice, args.exp_name) 
     if visual_warning and args.visu != '':
         print('Visualization Failed: You can only choose a point cloud shape to visualize within the scope of the test class')
     test_true_cls = np.concatenate(test_true_cls)
@@ -457,8 +461,19 @@ def test(args, io):
     io.cprint(outstr)
 
 
+def seed_everything(seed: int):
+
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True # type: ignore
+    torch.backends.cudnn.benchmark = True  # type: ignore
+
+
 def main(args):
-    io = IOStream('outputs/' + args.exp_name + '/run.log')
+    io = IOStream('outputs/partseg/' + args.exp_name + '/run.log')
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     args.world_size = int(os.environ["WORLD_SIZE"])
@@ -469,8 +484,7 @@ def main(args):
         io.cprint(str(args))
 
     torch.cuda.set_device(args.local_rank)  # before your code runs
-    torch.backends.cudnn.benchmark = True  # type: ignore
-    torch.manual_seed(args.seed)
+    seed_everything(args.seed)
     io.cprint(
         'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
     torch.cuda.manual_seed(args.seed)
@@ -479,9 +493,6 @@ def main(args):
     # setup the process group
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    # dist.init_process_group('nccl', init_method='env://', 
-    #                         world_size=args.world_size,
-    #                         rank=args.rank)
     dist.init_process_group('nccl')
 
     if not args.eval:
@@ -528,8 +539,6 @@ if __name__ == "__main__":
                         help='Scheduler to use, [cos, cycle]')
     parser.add_argument('--no_cuda', default=False, action='store_true',
                         help='disables CUDA training')
-    parser.add_argument('--use_custom_attention', default=False, action='store_true',
-                        help='use a custom attention mechanism for fusion')
     parser.add_argument('--use_height', default=False, action='store_true',
                         help='append relative height of each point as an extra feature')
     parser.add_argument('--ff_dims', type=int, default=512,
@@ -550,7 +559,7 @@ if __name__ == "__main__":
                         help='num of points to use')
     parser.add_argument('--nclasses', type=int, default=50, 
                         help='number of classes to predict')
-    parser.add_argument('--k', type=int, default=20, metavar='N',
+    parser.add_argument('--k', type=int, default=32, metavar='N',
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_path', type=str, default='', metavar='N',
                         help='Pretrained model path')
@@ -564,6 +573,6 @@ if __name__ == "__main__":
     with open("args.pkl", "wb") as f:
         pickle.dump(args, f)
     
-    _init_()
+    _init_(args.exp_name)
 
     main(args)
