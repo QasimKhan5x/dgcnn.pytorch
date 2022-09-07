@@ -7,9 +7,6 @@
 @Time: 2021/7/20 7:49 PM
 """
 
-
-from __future__ import print_function
-
 import argparse
 import gc
 import os
@@ -30,9 +27,10 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from data import S3DIS
+import s3dis_transforms as T
 from loss import cross_entropy
-from models.model_partseg import Net
+from models.model_semseg import Net
+from s3dis import S3DIS
 from util import IOStream
 
 global room_seg
@@ -55,7 +53,7 @@ def _init_(exp_name):
         os.makedirs(f'{BASE_DIR}/checkpoints')
     if not os.path.exists(f'{BASE_DIR}/backups'):
         os.makedirs(f'{BASE_DIR}/backups')
-    os.system(f'cp main_partseg.py {BASE_DIR}/backups/main_partseg.py.backup')
+    os.system(f'cp main_semseg.py {BASE_DIR}/backups/main_semseg.py.backup')
     os.system(f'cp loss.py {BASE_DIR}/backups/loss.py.backup')
     os.system(f'cp data.py {BASE_DIR}/backups/data.py.backup')
     os.system(f'cp models/* {BASE_DIR}/backups/')
@@ -236,17 +234,21 @@ def load_checkpoint(path, args, train_dl_size):
 
 
 def train(args, io):
-    train_ds = S3DIS(partition='train',
-                     num_points=args.num_points, test_area=args.test_area)
-    test_ds = S3DIS(partition='test', num_points=args.num_points,
-                    test_area=args.test_area)
+    train_ds = S3DIS(split='train', voxel_max=24000, presample=True, transform=T.Compose([
+        T.PointCloudFloorCentering(), T.AppendHeight(),
+        T.RandomScale(), T.RandomRotate(), T.RandomJitter(),
+        T.ChromaticNormalize(), T.ChromaticAutoContrast(),
+        T.RandomDropColor(), T.ToTensor()
+    ]))
+    test_ds = S3DIS(split='val', transform=[
+        T.PointCloudFloorCentering(), T.AppendHeight(),
+        T.ChromaticNormalize(), T.ToTensor()])
 
-    drop_last = len(train_ds) >= 100
     ngpus_per_node = torch.cuda.device_count()
     args.batch_size = int(args.batch_size / ngpus_per_node)
     args.test_batch_size = int(args.test_batch_size / ngpus_per_node)
 
-    train_loader = prepare_dl(train_ds, drop_last=drop_last,
+    train_loader = prepare_dl(train_ds, drop_last=True,
                               batch_size=args.batch_size, pin_memory=True)
     test_loader = prepare_dl(test_ds, drop_last=False,
                              batch_size=args.test_batch_size, pin_memory=False)
@@ -306,14 +308,16 @@ def train(args, io):
         train_pred_cls = []
         train_true_seg = []
         train_pred_seg = []
-        for data, seg in tqdm(train_loader):
-            data, seg = data.cuda(local_rank, non_blocking=True), seg.cuda(
-                local_rank, non_blocking=True)
-            data = data.transpose(2, 1).contiguous()
-            batch_size = data.size()[0]
+        for item in tqdm(train_loader):
+            pos, feat, seg = item['pos'], item['x'], item['y']
+            pos, feat, seg = pos.cuda(local_rank, non_blocking=True), feat.cuda(
+                local_rank, non_blocking=True), seg.cuda(local_rank, non_blocking=True)
+            pos = pos.transpose(2, 1).contiguous()
+            feat = feat.transpose(2, 1).contiguous()
+            batch_size = pos.size()[0]
             opt.zero_grad()
             with torch.cuda.amp.autocast(): # type: ignore
-                seg_pred = model(data)
+                seg_pred = model(pos, feat)
                 seg_pred = seg_pred.transpose(2, 1).contiguous()
                 if torch.isnan(seg_pred).sum() > 0:
                     print("NaNs detected!!! Stopping training")
@@ -321,7 +325,7 @@ def train(args, io):
                     torch.save(model.module.state_dict(),
                                f"weights_{local_rank}.pt")
                     sys.exit(0)
-                loss = criterion(seg_pred.view(-1, 13),
+                loss = criterion(seg_pred.view(-1, args.nclasses),
                                  seg.view(-1, 1).squeeze())
                 ddp_train_loss[0] += loss.item()
             fp16_scaler.scale(loss).backward()  # type: ignore
@@ -368,13 +372,15 @@ def train(args, io):
         test_pred_cls = []
         test_true_seg = []
         test_pred_seg = []
-        for data, seg in test_loader:
-            data, seg = data.cuda(device, non_blocking=True), seg.cuda(
-                device, non_blocking=True)
-            data = data.transpose(2, 1)
-            batch_size = data.size()[0]
+        for item in test_loader:
+            pos, feat, seg = item['pos'], item['x'], item['y']
+            pos, feat, seg = pos.cuda(local_rank, non_blocking=True), feat.cuda(
+                local_rank, non_blocking=True), seg.cuda(local_rank, non_blocking=True)
+            pos = pos.transpose(2, 1).contiguous()
+            feat = feat.transpose(2, 1).contiguous()
+            batch_size = pos.size()[0]
             with torch.no_grad():
-                seg_pred = model(data)
+                seg_pred = model(pos, feat)
                 seg_pred = seg_pred.transpose(2, 1).contiguous()
                 loss = criterion(seg_pred.view(-1, 13), seg.view(-1, 1).squeeze())
             pred = seg_pred.max(dim=2)[1]
@@ -507,7 +513,7 @@ def seed_everything(seed: int):
 
 
 def main(args):
-    io = IOStream('outputs/partseg/' + args.exp_name + '/run.log')
+    io = IOStream('outputs/semseg/' + args.exp_name + '/run.log')
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     args.world_size = int(os.environ["WORLD_SIZE"])
@@ -587,8 +593,6 @@ if __name__ == "__main__":
                         help='num of points to use')
     parser.add_argument('--dropout', type=float, default=0.5,
                         help='dropout rate')
-    parser.add_argument('--emb_dims', type=int, default=512, metavar='N',
-                        help='Dimension of embeddings')
     parser.add_argument('--k', type=int, default=32, metavar='N',
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_path', type=str, default='', metavar='N',

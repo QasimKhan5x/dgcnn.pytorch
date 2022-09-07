@@ -3,7 +3,7 @@ import copy
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.attention import MultiHeadVectorAttention, VectorAttention
+from models.attention import MultiHeadVectorAttention
 
 # Part of the code is referred from: http://nlp.seas.harvard.edu/annotated-transformer/
 
@@ -41,14 +41,13 @@ class Encoder(nn.Module):
     def __init__(self, layer, N):
         super(Encoder, self).__init__()
         self.layers = clones(layer, N)
-        self.norm = nn.BatchNorm1d(layer.size)
+        self.norm = nn.LayerNorm(layer.size)
 
     def forward(self, x, pointcloud=None):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
             x = layer(x, pointcloud)
-        x = self.norm(x.transpose(1, 2).contiguous()
-                      ).transpose(1, 2).contiguous()
+        x = self.norm(x)
         return x
 
 
@@ -58,13 +57,12 @@ class Decoder(nn.Module):
     def __init__(self, layer, N):
         super(Decoder, self).__init__()
         self.layers = clones(layer, N)
-        self.norm = nn.BatchNorm1d(layer.size)
+        self.norm = nn.LayerNorm(layer.size)
 
     def forward(self, x, memory, pointcloud=None):
         for layer in self.layers:
             x = layer(x, memory, pointcloud)
-        x = self.norm(x.transpose(1, 2).contiguous()
-                      ).transpose(1, 2).contiguous()
+        x = self.norm(x)
         return x
 
 
@@ -76,13 +74,12 @@ class SublayerConnection(nn.Module):
 
     def __init__(self, size, dropout):
         super(SublayerConnection, self).__init__()
-        self.norm = nn.BatchNorm1d(size)
+        self.norm = nn.LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
-        x = self.norm(x.transpose(1, 2).contiguous()
-                      ).transpose(1, 2).contiguous()
+        x = self.norm(x)
         return x + self.dropout(sublayer(x)[0])
 
 
@@ -130,15 +127,12 @@ class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super(PositionwiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(d_model, d_ff)
-        self.norm = nn.BatchNorm1d(d_ff)
+        self.norm = nn.LayerNorm(d_ff)
         self.w_2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
-        return self.w_2(self.dropout(self.norm(F.leaky_relu(self.w_1(x),
-         0.2).transpose(2,
-          1).contiguous())).transpose(2,
-           1).contiguous())
+        return self.w_2(self.dropout(self.norm(F.leaky_relu(self.w_1(x), 0.2))))
 
 
 class Transformer(nn.Module):
@@ -151,7 +145,7 @@ class Transformer(nn.Module):
         self.n_heads = args.n_heads
 
         c = copy.deepcopy
-        attn = MultiHeadVectorAttention(args)
+        attn = (args)
         ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
 
         self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),

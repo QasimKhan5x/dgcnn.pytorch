@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 from models.dgcnn import DGCNN_PNeXt
-from models.hog import compute_hog_1x1
 from models.layers import ResidualConvLayer
 
 
@@ -25,7 +24,6 @@ class MLPHead(nn.Module):
         global_ftrs = input[1]
         # number of points in individual PC
         N = point_ftrs.size(2) 
-
         # (batch_size, 3 + emb_dim * 2, num_points)
         x = torch.cat((point_ftrs, global_ftrs), dim=1)
         return self.clf(x)
@@ -35,32 +33,32 @@ class Net(nn.Module):
     def __init__(self, args):
         super(Net, self).__init__()
 
+        # xyz + rgb + height
+        total_channels = 3 + 3 + 1
+
         self.k = args.k
-        # height appending
-        extra_channels = 3 if args.use_height else 0
         # hog
-        extra_channels += 18
+        # total_channels += 18
         # dgcnn graph features
-        self.emb_nn = DGCNN_PNeXt(args, c_in=9+extra_channels)
+        self.emb_nn = DGCNN_PNeXt(args, c_in=total_channels)
         # positional embeddings
         # self.pos_mlp = nn.Sequential(
             # PositionEmbedding(args, c_in=3+extra_channels))
         self.head = MLPHead(args)
 
-    def forward(self, src):
+    def forward(self, pos, feat):
         '''
         src (batch_size, channels, num_points)
 
         channels = xyz + rgb + normalized position xyz (9)
         '''
-        hog = compute_hog_1x1(src[:, :3], k=self.k)
-        src = torch.cat((src, hog), dim=1)
+        # hog = compute_hog_1x1(pos, k=self.k)
+        # src = torch.cat((src, hog), dim=1)
         # (batch_size, emb_dims, num_points) (check result with and without pos_mlp)
         # canonical = self.pos_mlp(src)
-        graph_point_ftrs, graph_global_ftrs = self.emb_nn(src)
+        graph_point_ftrs, graph_global_ftrs = self.emb_nn(pos, feat)
         # (batch_size, nclasses, num_points)
         logits = self.head(graph_point_ftrs, graph_global_ftrs)
-
         # seg_pred = logits.permute(0, 2, 1).contiguous()
         # seg_pred = seg_pred.view(-1, 50)
         return logits
