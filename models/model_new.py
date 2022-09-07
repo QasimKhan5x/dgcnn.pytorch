@@ -1,7 +1,5 @@
 
-import torch
 import torch.nn as nn
-
 from dgl.geometry import farthest_point_sampler
 
 from models.dgcnn import DGCNN_PNeXt, knn
@@ -29,9 +27,22 @@ def select_and_expand(pc, k, num_centroids):
     return centroids
 
 
-class EncoderLayer(nn.Module):
-    def __init__(self) -> None:
+class LocalEncoderLayer(nn.Module):
+    '''
+    This encoder is applied locally on a subcloud
+    '''
+
+    def __init__(self, size, nhead, dim_ff, dropout, num_layers) -> None:
         super().__init__()
+
+        self.layer = nn.TransformerEncoder(encoder_layer=nn.TransformerEncoderLayer(d_model=size, nhead=nhead,
+                                           dim_feedforward=dim_ff,
+                                           dropout=dropout, batch_first=True), num_layers=num_layers)
+        
+    def forward(self, x):
+        # x (B x N x C)
+        return self.layer(x)
+
 
 
 class Encoder(nn.Module):
