@@ -235,14 +235,17 @@ def load_checkpoint(path, args, train_dl_size):
 
 def train(args, io):
     train_ds = S3DIS(split='train', voxel_max=24000, presample=True, transform=T.Compose([
-        T.PointCloudFloorCentering(), T.AppendHeight(),
-        T.RandomScale(), T.RandomRotate(), T.RandomJitter(),
-        T.ChromaticNormalize(), T.ChromaticAutoContrast(),
-        T.RandomDropColor(), T.ToTensor()
+        # T.AppendHeight(), T.PointCloudFloorCentering(),
+        # T.RandomScale(), T.RandomRotate(), T.RandomJitter(),
+        T.ChromaticNormalize(), #T.ChromaticAutoContrast(),
+        #T.RandomDropColor(),
+         T.ToTensor()
     ]))
-    test_ds = S3DIS(split='val', transform=[
-        T.PointCloudFloorCentering(), T.AppendHeight(),
-        T.ChromaticNormalize(), T.ToTensor()])
+    test_ds = S3DIS(split='val', transform=T.Compose([
+        T.PointCloudFloorCentering(),
+        T.ChromaticNormalize(),
+        T.ToTensor()])
+    )
 
     ngpus_per_node = torch.cuda.device_count()
     args.batch_size = int(args.batch_size / ngpus_per_node)
@@ -329,9 +332,10 @@ def train(args, io):
                                  seg.view(-1, 1).squeeze())
                 ddp_train_loss[0] += loss.item()
             fp16_scaler.scale(loss).backward()  # type: ignore
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10, norm_type=2)
             fp16_scaler.step(opt)
-            scheduler.step()
             fp16_scaler.update()
+            scheduler.step()
             # (batch_size, num_points)
             pred = seg_pred.max(dim=2)[1]
             ddp_train_loss[0] += loss.item() * batch_size
@@ -361,59 +365,60 @@ def train(args, io):
                                                                                                       np.mean(train_ious)
                                                                                                       )
             io.cprint(outstr)
+        opt.zero_grad()
         gc.collect()
         torch.cuda.empty_cache()
         ####################
         # Test
         ####################
-        ddp_test_loss = torch.zeros(2).to(torch.device(local_rank))
-        model.eval()
-        test_true_cls = []
-        test_pred_cls = []
-        test_true_seg = []
-        test_pred_seg = []
-        for item in test_loader:
-            pos, feat, seg = item['pos'], item['x'], item['y']
-            pos, feat, seg = pos.cuda(local_rank, non_blocking=True), feat.cuda(
-                local_rank, non_blocking=True), seg.cuda(local_rank, non_blocking=True)
-            pos = pos.transpose(2, 1).contiguous()
-            feat = feat.transpose(2, 1).contiguous()
-            batch_size = pos.size()[0]
-            with torch.no_grad():
-                seg_pred = model(pos, feat)
-                seg_pred = seg_pred.transpose(2, 1).contiguous()
-                loss = criterion(seg_pred.view(-1, 13), seg.view(-1, 1).squeeze())
-            pred = seg_pred.max(dim=2)[1]
-            ddp_test_loss[0] += loss.item() * batch_size
-            ddp_test_loss[1] += batch_size
-            seg_np = seg.cpu().numpy()
-            pred_np = pred.detach().cpu().numpy()
-            test_true_cls.append(seg_np.reshape(-1))
-            test_pred_cls.append(pred_np.reshape(-1))
-            test_true_seg.append(seg_np)
-            test_pred_seg.append(pred_np)
-        test_true_cls = np.concatenate(test_true_cls)
-        test_pred_cls = np.concatenate(test_pred_cls)
-        test_acc = metrics.accuracy_score(test_true_cls, test_pred_cls)
-        avg_per_class_acc = metrics.balanced_accuracy_score(
-            test_true_cls, test_pred_cls)
-        test_true_seg = np.concatenate(test_true_seg, axis=0)
-        test_pred_seg = np.concatenate(test_pred_seg, axis=0)
-        test_ious = calculate_sem_IoU(test_pred_seg, test_true_seg)
-        if local_rank == 0:
-            outstr = 'Test %d, loss: %.6f, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
-                                                                                                  ddp_test_loss[0] /
-                                                                                                  ddp_test_loss[1],
-                                                                                                  test_acc,
-                                                                                                  avg_per_class_acc,
-                                                                                                  np.mean(test_ious))
-            io.cprint(outstr)
-            if np.mean(test_ious) >= best_test_iou:
-                best_test_iou = np.mean(test_ious)
-                save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
-                                ddp_test_loss[1], args.exp_name, best=True)
-        gc.collect()
-        torch.cuda.empty_cache()
+        # ddp_test_loss = torch.zeros(2).to(torch.device(local_rank))
+        # model.eval()
+        # test_true_cls = []
+        # test_pred_cls = []
+        # test_true_seg = []
+        # test_pred_seg = []
+        # for item in test_loader:
+        #     pos, feat, seg = item['pos'], item['x'], item['y']
+        #     pos, feat, seg = pos.cuda(local_rank, non_blocking=True), feat.cuda(
+        #         local_rank, non_blocking=True), seg.cuda(local_rank, non_blocking=True)
+        #     pos = pos.transpose(2, 1).contiguous()
+        #     feat = feat.transpose(2, 1).contiguous()
+        #     batch_size = pos.size()[0]
+        #     with torch.no_grad():
+        #         seg_pred = model(pos, feat)
+        #         seg_pred = seg_pred.transpose(2, 1).contiguous()
+        #         loss = criterion(seg_pred.view(-1, 13), seg.view(-1, 1).squeeze())
+        #     pred = seg_pred.max(dim=2)[1]
+        #     ddp_test_loss[0] += loss.item() * batch_size
+        #     ddp_test_loss[1] += batch_size
+        #     seg_np = seg.cpu().numpy()
+        #     pred_np = pred.detach().cpu().numpy()
+        #     test_true_cls.append(seg_np.reshape(-1))
+        #     test_pred_cls.append(pred_np.reshape(-1))
+        #     test_true_seg.append(seg_np)
+        #     test_pred_seg.append(pred_np)
+        # test_true_cls = np.concatenate(test_true_cls)
+        # test_pred_cls = np.concatenate(test_pred_cls)
+        # test_acc = metrics.accuracy_score(test_true_cls, test_pred_cls)
+        # avg_per_class_acc = metrics.balanced_accuracy_score(
+        #     test_true_cls, test_pred_cls)
+        # test_true_seg = np.concatenate(test_true_seg, axis=0)
+        # test_pred_seg = np.concatenate(test_pred_seg, axis=0)
+        # test_ious = calculate_sem_IoU(test_pred_seg, test_true_seg)
+        # if local_rank == 0:
+        #     outstr = 'Test %d, loss: %.6f, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (epoch,
+        #                                                                                           ddp_test_loss[0] /
+        #                                                                                           ddp_test_loss[1],
+        #                                                                                           test_acc,
+        #                                                                                           avg_per_class_acc,
+        #                                                                                           np.mean(test_ious))
+        #     io.cprint(outstr)
+        #     if np.mean(test_ious) >= best_test_iou:
+        #         best_test_iou = np.mean(test_ious)
+        #         save_checkpoint(epoch, model, opt, scheduler, ddp_test_loss[0] /
+        #                         ddp_test_loss[1], args.exp_name, best=True)
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
 
 def test(args, io):

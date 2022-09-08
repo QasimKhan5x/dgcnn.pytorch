@@ -157,12 +157,35 @@ class DGCNN_PNeXt(nn.Module):
         emb_dims = args.emb_dims
         self.k = args.k
 
-        self.conv1 = InvResMLP(c_in, emb_dims, k=self.k)
+        self.conv1 = InvResMLP(c_in, emb_dims // 8, k=self.k)
+        self.conv2 = InvResMLP(emb_dims // 8 + 3, emb_dims // 8, k=self.k)
+        self.conv3 = InvResMLP(emb_dims // 8 + 3, emb_dims // 4, k=self.k)
+        self.conv4 = InvResMLP(emb_dims // 4 + 3, emb_dims // 2, k=self.k)
+
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(emb_dims + 3, emb_dims, kernel_size=1, bias=False),
+            nn.BatchNorm1d(emb_dims),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        )
 
     def forward(self, xyz, x):
         num_points = xyz.size(2)
 
         # B C N
         x = torch.cat((xyz, x), dim=1)
-        x = self.conv1(x)
-        return x
+        x1 = self.conv1(x)
+        # add original points (C += 3)
+        x1 = torch.cat((xyz, x1), dim=1)
+        # B x (64) x N (add features except first 3 dims bcz they are coordinates)
+        x2 = self.conv2(x1) + x1[:, 3:]
+        x2 = torch.cat((xyz, x2), dim=1)
+        x3 = self.conv3(x2)
+        x3 = torch.cat((xyz, x3), dim=1)
+        x4 = self.conv4(x3) # don't add to x4 because no more convolutions applied
+        # B x C + 3 x N (x1 already has the required dims so no need to repeat it)
+        point_ftrs = torch.cat((x1, x2[:, 3:], x3[:, 3:], x4), dim=1)
+        # mlp on point features B x C x N
+        x = self.conv5(point_ftrs)
+        # global features (B x emb_dims x num_points)
+        global_ftrs = x.max(dim=-1, keepdim=True)[0].repeat(1, 1, num_points)
+        return point_ftrs, global_ftrs

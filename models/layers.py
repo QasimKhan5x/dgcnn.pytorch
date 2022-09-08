@@ -80,13 +80,13 @@ class ResidualConvLayer(nn.Module):
 
         self.conv1 = nn.Sequential(
             layer(c_in, c_mid, 1, bias=False),
-            bn(c_mid),
+            # bn(c_mid),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
             nn.Dropout(dp1)
         )
         self.conv2 = nn.Sequential(
             layer(c_mid, c_out, 1, bias=False),
-            bn(c_out),
+            # bn(c_out),
         )
         self.reshape = layer(c_in, c_out, 1, bias=False)
         self.dp = nn.Dropout(dp2)        

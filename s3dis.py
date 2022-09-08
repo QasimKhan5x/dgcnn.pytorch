@@ -138,8 +138,8 @@ class S3DIS(Dataset):
         data = {'pos': coord, 'x': feat, 'y': label}
         # augmentation
         if self.transform is not None:
-            data['pos'], data['x'], data['y'] = self.transform(
-                data['pos'], data['x'], data['y'])
+            data['pos'], data['x'], data['y'] = self.transform(data['pos'], data['x'], data['y'])
+        # data['x'] = torch.cat((data['x'], torch.from_numpy(coord[:, 3-self.n_shifted:3].astype(np.float32))), dim=-1)
         return data
 
     def __len__(self):
